@@ -1,11 +1,11 @@
 [build-system]
 # Should be mirrored in requirements-build.txt
 requires = [
+    "numpy",
     "cmake>=3.26",
     "ninja",
     "packaging",
     "setuptools >= 49.4.0",
-    "torch == 2.4.0",
     "wheel",
     "jinja2",
 ]
