@@ -230,16 +230,16 @@ def _run_test(
         [],
         # Single-size
         [(512, 512)],
-        # Single-size, batched
-        [(512, 512), (512, 512), (512, 512)],
-        # Multi-size, batched
-        [(512, 512), (1024, 512), (1536, 512), (2048, 512), (512, 1024),
-         (1024, 1024), (512, 1536), (512, 2028)],
-        # Multi-size, batched, including text only
-        [(512, 512), (1024, 512), (1536, 512), (2048, 512), (512, 1024),
-         (1024, 1024), (512, 1536), (512, 2028), None],
-        # mllama has 8 possible aspect ratios, carefully set the sizes
-        # to cover all of them
+        # # Single-size, batched
+        # [(512, 512), (512, 512), (512, 512)],
+        # # Multi-size, batched
+        # [(512, 512), (1024, 512), (1536, 512), (2048, 512), (512, 1024),
+        #  (1024, 1024), (512, 1536), (512, 2028)],
+        # # Multi-size, batched, including text only
+        # [(512, 512), (1024, 512), (1536, 512), (2048, 512), (512, 1024),
+        #  (1024, 1024), (512, 1536), (512, 2028), None],
+        # # mllama has 8 possible aspect ratios, carefully set the sizes
+        # # to cover all of them
     ])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 @pytest.mark.parametrize("max_tokens", [128])

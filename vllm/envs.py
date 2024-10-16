@@ -194,6 +194,21 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     "LD_LIBRARY_PATH":
     lambda: os.environ.get("LD_LIBRARY_PATH", None),
 
+    # flag to tell vllm to prefer torch on ROCm
+    "VLLM_ROCM_PREFER_TORCH":
+    lambda: (os.environ.get("VLLM_ROCM_PREFER_TORCH", "False").lower() in
+             ("true", "1")),
+
+    # flag to tell vllm to prefer triton on ROCm
+    "VLLM_ROCM_PREFER_TRITON":
+    lambda: (os.environ.get("VLLM_ROCM_PREFER_TRITON", "True").lower() in
+             ("true", "1")),
+
+    # flag to control if vllm should use naive scaled dot-product attention
+    "VLLM_USE_SDPA_ATTENTION":
+    lambda: (os.environ.get("VLLM_USE_SDPA_ATTENTION", "False").lower() in
+             ("true", "1")),
+
     # flag to control if vllm should use triton flash attention
     "VLLM_USE_TRITON_FLASH_ATTN":
     lambda: (os.environ.get("VLLM_USE_TRITON_FLASH_ATTN", "True").lower() in
