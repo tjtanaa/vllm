@@ -14,17 +14,6 @@ ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG MORI_BRANCH="2d02c6a9"
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
 
-#TODO: When patch has been upstreamed, switch to the main repo/branch
-# ARG RIXL_BRANCH="<TODO>"
-# ARG RIXL_REPO="https://github.com/ROCm/RIXL.git"
-ARG RIXL_BRANCH="50d63d94"
-ARG RIXL_REPO="https://github.com/vcave/RIXL.git"
-# Needed by RIXL
-ARG ETCD_BRANCH="7c6e714f"
-ARG ETCD_REPO="https://github.com/etcd-cpp-apiv3/etcd-cpp-apiv3.git"
-ARG UCX_BRANCH="da3fac2a"
-ARG UCX_REPO="https://github.com/ROCm/ucx.git"
-
 # Sccache configuration (only used in release pipeline)
 ARG USE_SCCACHE
 ARG SCCACHE_DOWNLOAD_URL
@@ -126,7 +115,7 @@ RUN git clone ${TRITON_REPO}
 RUN cd triton \
     && git checkout ${TRITON_BRANCH} \
     && if [ ! -f setup.py ]; then cd python; fi \
-    && python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38 \
+    && python3 setup.py bdist_wheel --dist-dir=dist \
     && mkdir -p /app/install && cp dist/*.whl /app/install
 RUN if [ -d triton/python/triton_kernels ]; then pip install build && cd triton/python/triton_kernels \
     && python3 -m build --wheel && cp dist/*.whl /app/install; fi
@@ -163,7 +152,7 @@ RUN cd pytorch && git checkout ${PYTORCH_BRANCH} \
            && export CMAKE_CXX_COMPILER_LAUNCHER=sccache \
            && sccache --show-stats; \
        fi \
-    && CMAKE_PREFIX_PATH=$(python3 -c 'import sys; print(sys.prefix)') python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38 \
+    && CMAKE_PREFIX_PATH=$(python3 -c 'import sys; print(sys.prefix)') python3 setup.py bdist_wheel --dist-dir=dist \
     && if [ "$USE_SCCACHE" = "1" ]; then sccache --show-stats; fi \
     && pip install dist/*.whl
 RUN git clone ${PYTORCH_VISION_REPO} vision
@@ -173,7 +162,7 @@ RUN cd vision && git checkout ${PYTORCH_VISION_BRANCH} \
            && export CMAKE_C_COMPILER_LAUNCHER=sccache \
            && export CMAKE_CXX_COMPILER_LAUNCHER=sccache; \
        fi \
-    && python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38 \
+    && python3 setup.py bdist_wheel --dist-dir=dist \
     && if [ "$USE_SCCACHE" = "1" ]; then sccache --show-stats; fi \
     && pip install dist/*.whl
 RUN git clone ${PYTORCH_AUDIO_REPO} audio
@@ -185,7 +174,7 @@ RUN cd audio && git checkout ${PYTORCH_AUDIO_BRANCH} \
            && export CMAKE_C_COMPILER_LAUNCHER=sccache \
            && export CMAKE_CXX_COMPILER_LAUNCHER=sccache; \
        fi \
-    && python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38 \
+    && python3 setup.py bdist_wheel --dist-dir=dist \
     && if [ "$USE_SCCACHE" = "1" ]; then sccache --show-stats; fi \
     && pip install dist/*.whl
 RUN mkdir -p /app/install && cp /app/pytorch/dist/*.whl /app/install \
@@ -210,126 +199,6 @@ RUN mkdir -p /app/install && cp /app/mori/dist/*.whl /app/install
 
 
 ###
-### RIXL Build
-###
-FROM build_pytorch AS build_rixl
-ARG RIXL_BRANCH
-ARG RIXL_REPO
-ARG ETCD_BRANCH
-ARG ETCD_REPO
-ARG UCX_BRANCH
-ARG UCX_REPO
-ARG USE_SCCACHE
-
-ENV ROCM_PATH=/opt/rocm
-ENV UCX_HOME=/usr/local/ucx
-ENV RIXL_HOME=/usr/local/rixl
-ENV RIXL_BENCH_HOME=/usr/local/rixl_bench
-
-# RIXL build system dependences and RDMA support
-RUN apt-get -y update && apt-get -y install autoconf libtool pkg-config \
-    libgrpc-dev \
-    libgrpc++-dev \
-    libprotobuf-dev \
-    protobuf-compiler-grpc \
-    libcpprest-dev \
-    libaio-dev \
-    librdmacm1 \
-    librdmacm-dev \
-    libibverbs1 \
-    libibverbs-dev \
-    ibverbs-utils \
-    rdmacm-utils \
-    ibverbs-providers
-
-RUN pip install meson auditwheel patchelf tomlkit
-
-WORKDIR /workspace
-
-# Build etcd-cpp-apiv3 (CMake)
-RUN git clone ${ETCD_REPO} && \
-    cd etcd-cpp-apiv3 && \
-    git checkout ${ETCD_BRANCH} && \
-    mkdir build && cd build && \
-    if [ "$USE_SCCACHE" = "1" ]; then \
-        cmake .. -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
-            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
-            -DCMAKE_HIP_COMPILER_LAUNCHER=sccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache; \
-    else \
-        cmake .. -DCMAKE_POLICY_VERSION_MINIMUM=3.5; \
-    fi && \
-    make -j$(nproc) && \
-    make install && \
-    if [ "$USE_SCCACHE" = "1" ]; then sccache --show-stats; fi
-
-# Build UCX (autotools) - sccache via CC/CXX wrapper
-RUN cd /usr/local/src && \
-    git clone ${UCX_REPO} &&  \
-    cd ucx  && \
-    git checkout ${UCX_BRANCH} && \
-    ./autogen.sh && \
-    mkdir build && cd build && \
-    if [ "$USE_SCCACHE" = "1" ]; then \
-        CC="sccache gcc" CXX="sccache g++" ../configure \
-            --prefix=/usr/local/ucx \
-            --enable-shared \
-            --disable-static \
-            --disable-doxygen-doc \
-            --enable-optimizations \
-            --enable-devel-headers \
-            --with-rocm=/opt/rocm \
-            --with-verbs \
-            --with-dm \
-            --enable-mt; \
-    else \
-        ../configure \
-            --prefix=/usr/local/ucx \
-            --enable-shared \
-            --disable-static \
-            --disable-doxygen-doc \
-            --enable-optimizations \
-            --enable-devel-headers \
-            --with-rocm=/opt/rocm \
-            --with-verbs \
-            --with-dm \
-            --enable-mt; \
-    fi && \
-    make -j && \
-    make -j install && \
-    if [ "$USE_SCCACHE" = "1" ]; then sccache --show-stats; fi
-
-ENV PATH=/usr/local/ucx/bin:$PATH
-ENV LD_LIBRARY_PATH=${UCX_HOME}/lib:${LD_LIBRARY_PATH}
-
-# Build RIXL (meson) - sccache via environment
-RUN git clone ${RIXL_REPO} /opt/rixl && \
-    cd /opt/rixl && \
-    git checkout ${RIXL_BRANCH} && \
-    if [ "$USE_SCCACHE" = "1" ]; then \
-        CC="sccache gcc" CXX="sccache g++" meson setup build --prefix=${RIXL_HOME} \
-            -Ducx_path=${UCX_HOME} \
-            -Drocm_path=${ROCM_PATH}; \
-    else \
-        meson setup build --prefix=${RIXL_HOME} \
-            -Ducx_path=${UCX_HOME} \
-            -Drocm_path=${ROCM_PATH}; \
-    fi && \
-    cd build && \
-    ninja && \
-    ninja install && \
-    if [ "$USE_SCCACHE" = "1" ]; then sccache --show-stats; fi
-
-# Generate RIXL wheel
-RUN cd /opt/rixl && mkdir -p /app/install && \
-    ./contrib/build-wheel.sh \
-        --output-dir /app/install \
-        --rocm-dir ${ROCM_PATH} \
-        --ucx-plugins-dir ${UCX_HOME}/lib/ucx \
-        --nixl-plugins-dir ${RIXL_HOME}/lib/x86_64-linux-gnu/plugins
-
-
-###
 ### FlashAttention Build
 ###
 FROM base AS build_fa
@@ -346,7 +215,7 @@ RUN cd flash-attention \
            export HIP_CLANG_PATH=/opt/sccache-wrappers \
            && sccache --show-stats; \
        fi \
-    && GPU_ARCHS=$(echo ${PYTORCH_ROCM_ARCH} | sed -e 's/;gfx1[0-9]\{3\}//g') python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38 \
+    && GPU_ARCHS=$(echo ${PYTORCH_ROCM_ARCH} | sed -e 's/;gfx1[0-9]\{3\}//g') python3 setup.py bdist_wheel --dist-dir=dist \
     && if [ "$USE_SCCACHE" = "1" ]; then sccache --show-stats; fi
 RUN mkdir -p /app/install && cp /app/flash-attention/dist/*.whl /app/install
 
@@ -370,7 +239,7 @@ RUN pip install pyyaml && cd aiter \
            export HIP_CLANG_PATH=/opt/sccache-wrappers \
            && sccache --show-stats; \
        fi \
-    && PREBUILD_KERNELS=1 GPU_ARCHS=${AITER_ROCM_ARCH} python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38 \
+    && PREBUILD_KERNELS=1 GPU_ARCHS=${AITER_ROCM_ARCH} python3 setup.py bdist_wheel --dist-dir=dist \
     && if [ "$USE_SCCACHE" = "1" ]; then sccache --show-stats; fi \
     && ls /app/aiter/dist/*.whl
 RUN mkdir -p /app/install && cp /app/aiter/dist/*.whl /app/install
@@ -410,8 +279,6 @@ RUN --mount=type=bind,from=build_aiter,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
 RUN --mount=type=bind,from=build_mori,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
-RUN --mount=type=bind,from=build_rixl,src=/app/install/,target=/install \
-    cp /install/*.whl /app/debs
 
 FROM base AS final
 RUN --mount=type=bind,from=debs,src=/app/debs,target=/install \
@@ -430,12 +297,6 @@ ARG FA_BRANCH
 ARG FA_REPO
 ARG AITER_BRANCH
 ARG AITER_REPO
-ARG RIXL_BRANCH
-ARG RIXL_REPO
-ARG ETCD_BRANCH
-ARG ETCD_REPO
-ARG UCX_BRANCH
-ARG UCX_REPO
 ARG MORI_BRANCH
 ARG MORI_REPO
 RUN echo "BASE_IMAGE: ${BASE_IMAGE}" > /app/versions.txt \
@@ -451,11 +312,5 @@ RUN echo "BASE_IMAGE: ${BASE_IMAGE}" > /app/versions.txt \
     && echo "FA_REPO: ${FA_REPO}" >> /app/versions.txt \
     && echo "AITER_BRANCH: ${AITER_BRANCH}" >> /app/versions.txt \
     && echo "AITER_REPO: ${AITER_REPO}" >> /app/versions.txt \
-    && echo "RIXL_BRANCH: ${RIXL_BRANCH}" >> /app/versions.txt \
-    && echo "RIXL_REPO: ${RIXL_REPO}" >> /app/versions.txt \
-    && echo "ETCD_BRANCH: ${ETCD_BRANCH}" >> /app/versions.txt \
-    && echo "ETCD_REPO: ${ETCD_REPO}" >> /app/versions.txt \
-    && echo "UCX_BRANCH: ${UCX_BRANCH}" >> /app/versions.txt \
-    && echo "UCX_REPO: ${UCX_REPO}" >> /app/versions.txt \
     && echo "MORI_BRANCH: ${MORI_BRANCH}" >> /app/versions.txt \
     && echo "MORI_REPO: ${MORI_REPO}" >> /app/versions.txt
