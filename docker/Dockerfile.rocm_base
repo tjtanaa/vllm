@@ -137,7 +137,7 @@ RUN if [ -d triton/python/triton_kernels ]; then pip install build && cd triton/
 ###
 FROM base AS build_amdsmi
 RUN cd /opt/rocm/share/amd_smi \
-    && pip wheel . --wheel-dir=dist --py-limited-api=cp38
+    && pip wheel . --wheel-dir=dist
 RUN mkdir -p /app/install && cp /opt/rocm/share/amd_smi/dist/*.whl /app/install
 
 
