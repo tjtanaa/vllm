@@ -139,10 +139,8 @@ mkdir -p "$WORK_DIR/output"
 <html>
 <head>
     <meta name="pypi:repository-version" content="1.0">
-    <title>Simple Index</title>
 </head>
 <body>
-    <h1>Simple Index</h1>
 EOF
 
     while read -r pkg; do
