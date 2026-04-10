@@ -11,13 +11,6 @@ ARG FA_BRANCH="0e60e394"
 ARG FA_REPO="https://github.com/Dao-AILab/flash-attention.git"
 ARG AITER_BRANCH="v0.1.10.post2"
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
-ARG MORI_BRANCH="2f88d06aba75400262ca5c1ca5986cf1fdf4cd82"
-ARG MORI_REPO="https://github.com/ROCm/mori.git"
-# MORI NIC backend (same pattern as SGLang docker/rocm.Dockerfile): use ainic for AMD Pensando + ionic packages
-ARG NIC_BACKEND=none
-ARG AINIC_VERSION=1.117.5
-ARG UBUNTU_CODENAME=jammy
-
 # Sccache configuration (only used in release pipeline)
 ARG USE_SCCACHE
 ARG SCCACHE_DOWNLOAD_URL
@@ -34,7 +27,6 @@ ENV LD_LIBRARY_PATH=/opt/rocm/lib:/usr/local/lib:
 ARG PYTORCH_ROCM_ARCH=gfx90a;gfx942;gfx950;gfx1100;gfx1101;gfx1200;gfx1201;gfx1150;gfx1151
 ENV PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH}
 ENV AITER_ROCM_ARCH=gfx942;gfx950
-ENV MORI_GPU_ARCHS=gfx942;gfx950
 
 # Required for RCCL in ROCm7.1
 ENV HSA_NO_SCRATCH_RECLAIM=1
@@ -63,9 +55,6 @@ RUN apt-get update -y \
     && python3 --version && python3 -m pip --version
 
 RUN pip install -U packaging 'cmake<4' ninja wheel 'setuptools<80' pybind11 Cython
-# Install dependencies for MoriIO proxy
-RUN pip install -U --ignore-installed blinker && pip install -U quart aiohttp msgpack pyzmq
-RUN apt-get update && apt-get install -y libjpeg-dev libsox-dev libsox-fmt-all sox && rm -rf /var/lib/apt/lists/*
 
 # Install sccache if USE_SCCACHE is enabled (for release builds)
 ARG USE_SCCACHE
@@ -195,63 +184,6 @@ RUN mkdir -p /app/install && cp /app/pytorch/dist/*.whl /app/install \
 
 
 ###
-### MORI Build
-###
-FROM base AS build_mori
-ARG MORI_BRANCH
-ARG MORI_REPO
-ARG NIC_BACKEND
-ARG AINIC_VERSION
-ARG UBUNTU_CODENAME
-RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
-    pip install /install/*.whl
-# Base deps, optional AMD AINIC (libionic-dev / ionic-common), USE_IONIC for CMake — see SGLang docker/rocm.Dockerfile MORI block
-RUN /bin/bash -lc 'set -euo pipefail; \
-  echo "[MORI build] NIC_BACKEND=${NIC_BACKEND}"; \
-  apt-get update -y && apt-get install -y --no-install-recommends \
-    build-essential \
-    g++ \
-    jq \
-    libopenmpi-dev \
-    libpci-dev \
-    initramfs-tools \
-  && rm -rf /var/lib/apt/lists/*; \
-  case "${NIC_BACKEND}" in \
-    none) \
-      export USE_IONIC="OFF"; \
-      export USE_BNXT="OFF"; \
-      ;; \
-    ainic) \
-      export USE_IONIC="ON"; \
-      export USE_BNXT="OFF"; \
-      apt-get update -y && apt-get install -y --no-install-recommends \
-        ca-certificates curl gnupg apt-transport-https \
-      && rm -rf /var/lib/apt/lists/* && mkdir -p /etc/apt/keyrings; \
-      curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor > /etc/apt/keyrings/amdainic.gpg; \
-      echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdainic.gpg] https://repo.radeon.com/amdainic/pensando/ubuntu/${AINIC_VERSION} ${UBUNTU_CODENAME} main" \
-        > /etc/apt/sources.list.d/amdainic.list; \
-      apt-get update -y && apt-get install -y --no-install-recommends \
-        libionic-dev \
-        ionic-common \
-      ; \
-      rm -rf /var/lib/apt/lists/*; \
-      ;; \
-    *) \
-      echo "ERROR: unknown NIC_BACKEND=${NIC_BACKEND}. Use one of: none, ainic"; \
-      exit 2; \
-      ;; \
-  esac; \
-  export MORI_GPU_ARCHS="${MORI_GPU_ARCHS}"; \
-  echo "[MORI build] MORI_GPU_ARCHS=$$MORI_GPU_ARCHS USE_IONIC=$$USE_IONIC USE_BNXT=$$USE_BNXT"; \
-  git clone "${MORI_REPO}"; \
-  cd mori; \
-  git checkout "${MORI_BRANCH}"; \
-  git submodule update --init --recursive; \
-  python3 setup.py bdist_wheel --dist-dir=dist && ls /app/mori/dist/*.whl'
-RUN mkdir -p /app/install && cp /app/mori/dist/*.whl /app/install
-
-
-###
 ### FlashAttention Build
 ###
 FROM base AS build_fa
@@ -317,7 +249,7 @@ RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
 RUN --mount=type=bind,from=build_aiter,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
 
-# Full debs stage - includes Mori (used by Docker releases)
+# Full debs stage (used by Docker releases)
 FROM base AS debs
 RUN mkdir /app/debs
 RUN --mount=type=bind,from=build_triton,src=/app/install/,target=/install \
@@ -329,8 +261,6 @@ RUN --mount=type=bind,from=build_amdsmi,src=/app/install/,target=/install \
 RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
 RUN --mount=type=bind,from=build_aiter,src=/app/install/,target=/install \
-    cp /install/*.whl /app/debs
-RUN --mount=type=bind,from=build_mori,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
 
 FROM base AS final
@@ -350,8 +280,6 @@ ARG FA_BRANCH
 ARG FA_REPO
 ARG AITER_BRANCH
 ARG AITER_REPO
-ARG MORI_BRANCH
-ARG MORI_REPO
 ARG NIC_BACKEND
 ARG AINIC_VERSION
 ARG UBUNTU_CODENAME
@@ -367,8 +295,4 @@ RUN echo "BASE_IMAGE: ${BASE_IMAGE}" > /app/versions.txt \
     && echo "FA_BRANCH: ${FA_BRANCH}" >> /app/versions.txt \
     && echo "FA_REPO: ${FA_REPO}" >> /app/versions.txt \
     && echo "AITER_BRANCH: ${AITER_BRANCH}" >> /app/versions.txt \
-    && echo "AITER_REPO: ${AITER_REPO}" >> /app/versions.txt \
-    && echo "MORI_BRANCH: ${MORI_BRANCH}" >> /app/versions.txt \
-    && echo "MORI_REPO: ${MORI_REPO}" >> /app/versions.txt \
-    && echo "MORI_NIC_BACKEND: ${NIC_BACKEND}" >> /app/versions.txt \
-    && echo "AINIC_VERSION: ${AINIC_VERSION}" >> /app/versions.txt \
+    && echo "AITER_REPO: ${AITER_REPO}" >> /app/versions.txt
