@@ -43,7 +43,8 @@ def _torch_topk_softplus_sqrt(
 
 
 @pytest.mark.skipif(
-    not current_platform.is_cuda_alike(), reason="This test is skipped on non-CUDA platform."
+    not current_platform.is_cuda_alike(),
+    reason="This test is skipped on non-CUDA platform.",
 )
 @pytest.mark.parametrize("num_tokens", [1, 33, 128])
 @pytest.mark.parametrize("hidden_size", [1024, 2048])
@@ -98,7 +99,8 @@ def test_fused_topk_softplus_sqrt(
 
 
 @pytest.mark.skipif(
-    not current_platform.is_cuda_alike(), reason="This test is skipped on non-CUDA platform."
+    not current_platform.is_cuda_alike(),
+    reason="This test is skipped on non-CUDA platform.",
 )
 @pytest.mark.parametrize("num_tokens", [1, 33, 128])
 @pytest.mark.parametrize("hidden_size", [1024, 2048])
