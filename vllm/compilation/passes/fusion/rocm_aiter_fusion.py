@@ -231,6 +231,93 @@ class AiterRMSFp8GroupQuantPattern(AiterRMSNormQuantPattern):
         )
 
 
+class AiterRMSFp8GroupDoubleQuantPattern(AiterRMSNormQuantPattern):
+    """
+    Fuse two aiter group FP8 quant consumers of the same RMSNorm by
+    recomputing the RMSNorm inside each fused RMSNorm+group-quant op.
+    """
+
+    FUSED_OP = rocm_aiter_ops.get_rmsnorm_group_fused_quant_op()
+
+    def __init__(
+        self,
+        epsilon: float,
+        quant_dtype: torch.dtype,
+        group_shape: GroupShape,
+        keep_rms_output: bool = False,
+        match_aiter_quant: bool = True,
+        symmetric: bool = True,
+    ) -> None:
+        scale = ScaleDesc(torch.float32, False, group_shape)
+        key = FusedRMSQuantKey(
+            fused_add=False,
+            quant=QuantKey(dtype=quant_dtype, scale=scale, symmetric=symmetric),
+        )
+
+        self.keep_rms_output = keep_rms_output
+        super().__init__(epsilon, key, match_aiter_quant)
+
+    @staticmethod
+    def _distinct_quant_nodes(match: pm.Match) -> bool:
+        output_nodes = match.output_nodes()
+        if len(output_nodes) == 4:
+            result_0, _, result_1, _ = output_nodes
+        else:
+            result_0, _, _, result_1, _ = output_nodes
+
+        if result_0 is None or result_1 is None:
+            return False
+        quant_0, quant_1 = result_0.args[0], result_1.args[0]
+        return (
+            isinstance(quant_0, fx.Node)
+            and isinstance(quant_1, fx.Node)
+            and quant_0 is not quant_1
+        )
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        def pattern(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+        ) -> tuple[torch.Tensor, ...]:
+            result_rms = torch.ops.vllm_ir.rms_norm(input, weight, self.epsilon)
+            result_0, scale_0 = self.quant_matcher(result_rms)
+            result_1, scale_1 = self.quant_matcher(result_rms)
+            if self.keep_rms_output:
+                return result_0, result_rms, scale_0, result_1, scale_1
+            return result_0, scale_0, result_1, scale_1
+
+        def replacement(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+        ) -> tuple[torch.Tensor, ...]:
+            fused_0 = self.FUSED_OP(
+                x=input,
+                weight=weight,
+                variance_epsilon=self.epsilon,
+                group_size=128,
+            )
+            fused_1 = self.FUSED_OP(
+                x=input,
+                weight=weight,
+                variance_epsilon=self.epsilon,
+                group_size=128,
+            )
+            if self.keep_rms_output:
+                result_rms = torch.ops.vllm_ir.rms_norm(input, weight, self.epsilon)
+                return fused_0[0], result_rms, fused_0[1], fused_1[0], fused_1[1]
+            return fused_0[0], fused_0[1], fused_1[0], fused_1[1]
+
+        pm.register_replacement(
+            pattern,
+            replacement,
+            # input, weight
+            [self.empty(5, 16), self.empty(16)],
+            pm.fwd_only,
+            pm_pass,
+            extra_check=self._distinct_quant_nodes,
+        )
+
+
 class AiterFusedAddRMSFp8GroupQuantPattern(AiterRMSNormQuantPattern):
     """
     This pattern fuses aiter rms_norm_with_add & group fp8 quant custom ops
@@ -311,6 +398,17 @@ class RocmAiterRMSNormQuantFusionPass(VllmPatternMatcherPass):
         # Make sure fused add patterns are before simple rms norm,
         # as the latter is a subset of the former in torch ops
         for epsilon in [1e-5, 1e-6]:
+            # Fuse duplicate aiter group fp8 quant consumers first. This
+            # avoids an ad-hoc graph pre-pass while still removing unfused
+            # bf16 RMSNorm reads.
+            for keep_rms_output in [False, True]:
+                AiterRMSFp8GroupDoubleQuantPattern(
+                    epsilon,
+                    FP8_DTYPE,
+                    GroupShape(1, 128),
+                    keep_rms_output=keep_rms_output,
+                ).register(self.patterns)
+
             #  Fuse aiter rms_norm + aiter dynamic group fp8 quant
             AiterRMSFp8GroupQuantPattern(
                 epsilon, FP8_DTYPE, GroupShape(1, 128)
@@ -359,6 +457,7 @@ class RocmAiterRMSNormQuantFusionPass(VllmPatternMatcherPass):
             AiterRMSNormDynamicQuantPattern,
             AiterFusedAddRMSNormDynamicQuantPattern,
             AiterRMSFp8GroupQuantPattern,
+            AiterRMSFp8GroupDoubleQuantPattern,
             AiterFusedAddRMSFp8GroupQuantPattern,
         ]
         return self.hash_source(self, *fusion_patterns)
