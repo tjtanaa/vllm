@@ -204,13 +204,6 @@ def _get_gcn_arch() -> str:
         return _query_gcn_arch_from_amdsmi()
     except Exception as e:
         logger.debug("Failed to get GCN arch via amdsmi: %s", e)
-        # NOTE: use logger.debug, not warning_once, here. This runs at module
-        # load while resolving the platform; warning_once imports
-        # vllm.distributed, which causes a circular import before
-        # current_platform is bound. This path is taken on the FFM simulator,
-        # where amdsmi is unavailable (and would report the host's real gfx950
-        # cards rather than the simulated gfx1250) — torch.cuda below is correct.
-        logger.debug("Failed to get GCN arch via amdsmi, falling back to torch.cuda.")
     # Ultimate fallback: use torch.cuda (will initialize CUDA)
     return torch.cuda.get_device_properties("cuda").gcnArchName
 
@@ -232,7 +225,7 @@ _ON_GFX942 = "gfx942" in _GCN_ARCH
 _ON_GFX950 = "gfx950" in _GCN_ARCH
 _ON_GFX1250 = "gfx1250" in _GCN_ARCH
 
-_ON_CDNA = any(arch in _GCN_ARCH for arch in ["gfx9, gfx1250"])
+_ON_CDNA = any(arch in _GCN_ARCH for arch in ["gfx9", "gfx1250"])
 _ON_RDNA = any(
     arch
     for arch in _GCN_ARCH
@@ -375,7 +368,6 @@ def get_cdna_version() -> int:
     return -1
 
 
-
 # Enable HIP online tuning early, before hipBLASLt initializes.
 # Turn on hipBLASLt online tuning if use AITER hipBLASLt GEMM.
 if (
@@ -472,8 +464,8 @@ def _get_backend_priorities(
             ]
 
     backends = []
-    # ROCM_ATTN uses (2, num_blocks, ...) KV cache layout which is
-    # incompatible with KV connectors that require blocks-first layout.
+    # Keep ROCM_ATTN disabled for KV connectors until connector transfer
+    # semantics are validated for its asymmetric native K/V cache views.
     if not use_kv_connector:
         backends.append(AttentionBackendEnum.ROCM_ATTN)
     if rocm_aiter_ops.is_mha_enabled():
@@ -556,6 +548,20 @@ class RocmPlatform(Platform):
             attn_selector_config.use_sparse,
             attn_selector_config.use_kv_connector,
         )
+        from vllm.config import get_current_vllm_config_or_none
+
+        vllm_config = get_current_vllm_config_or_none()
+        is_encoder_decoder = (
+            getattr(getattr(vllm_config, "model_config", None), "attn_type", None)
+            == "encoder_decoder"
+        )
+        # ROCM_ATTN still uses a legacy attention layout (KV is the outer
+        # dimension) that is incompatible with the encoder backend layouts. The
+        # encoder and decoder need the layouts to match. This is currently
+        # enforced implicitly.
+        # TODO: Make this explicit in the selector in a future PR.
+        if is_encoder_decoder and AttentionBackendEnum.ROCM_ATTN in backend_priorities:
+            backend_priorities.remove(AttentionBackendEnum.ROCM_ATTN)
         for priority, backend in enumerate(backend_priorities):
             try:
                 backend_class = backend.get_class()

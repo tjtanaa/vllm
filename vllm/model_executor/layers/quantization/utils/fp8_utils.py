@@ -33,6 +33,7 @@ from vllm.utils.deep_gemm import (
     is_deep_gemm_e8m0_used,
     transform_sf_into_required_layout,
 )
+from vllm.utils.platform_utils import get_device_name_as_file_name
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
@@ -864,7 +865,7 @@ def get_w8a8_block_fp8_configs(
 
     # First look up if an optimized configuration is available in the configs
     # directory
-    device_name = current_platform.get_device_name().replace(" ", "_")
+    device_name = get_device_name_as_file_name()
     json_file_name = f"N={N},K={K},device_name={device_name},dtype=fp8_w8a8,block_shape=[{block_n},{block_k}].json"  # noqa: E501
 
     config_file_path = os.path.join(
@@ -941,7 +942,21 @@ def w8a8_triton_block_scaled_mm(
         _Bsf = _Bs.repeat_interleave(_bn, dim=0).repeat_interleave(_bk, dim=1)[:_N, :_K]
         _out = (_Af * _Asf) @ (_Bf * _Bsf).t()
         return _out.to(output_dtype).reshape(*A.shape[:-1], _N)
-
+    """This function performs matrix multiplication with block-wise
+    quantization.
+    It takes two input tensors `A` and `B` with scales `As` and `Bs`.
+    The output is returned in the specified `output_dtype`.
+    Args:
+        A: The input tensor, e.g., activation.
+        B: The input tensor, e.g., weight.
+        As: The per-token-group quantization scale for `A`.
+        Bs: The per-block quantization scale for `B`.
+        block_size: The block size for per-block quantization. It should
+        be 2-dim, e.g., [128, 128].
+        output_dtype: The dtype of the returned tensor.
+    Returns:
+        torch.Tensor: The result of matmul.
+    """
     assert len(block_size) == 2
     block_n, block_k = block_size[0], block_size[1]
 
