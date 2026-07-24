@@ -60,8 +60,13 @@ def use_split_kv_decode(
     if page_size >= 64:
         return True
     if window_left >= 0:
-        return page_size >= 32
+        return page_size >= 16
     return max_kv_len >= 8192
+
+
+@triton.jit
+def _round_up_to_multiple(number, multiple: tl.constexpr):
+    return tl.cdiv(number, multiple) * multiple
 
 
 @triton.jit
@@ -97,9 +102,6 @@ def _split_kv_stage1(
     stride_bt_b: tl.constexpr,
     page_size: tl.constexpr,
     window_left: tl.constexpr,
-    gqa_group_size: tl.constexpr,
-    num_q_heads: tl.constexpr,
-    head_dim: tl.constexpr,
     rel_extent: tl.constexpr,
     max_kv_splits: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -110,37 +112,36 @@ def _split_kv_stage1(
     pid_h = tl.program_id(1)
     pid_s = tl.program_id(2)
 
-    head_blocks_per_kv = tl.cdiv(gqa_group_size, BLOCK_H)
-    kv_head = pid_h // head_blocks_per_kv
-    valid_block_h: tl.constexpr = min(BLOCK_H, gqa_group_size)
-    off_h = pid_h * valid_block_h + tl.arange(0, BLOCK_H)
-    h_valid = (off_h < (pid_h + 1) * valid_block_h) & (off_h < num_q_heads)
-    off_d = tl.arange(0, BLOCK_D)
-    d_valid = off_d < head_dim
+    kv_head = pid_h
+    off_q_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    off_q_d = tl.arange(0, BLOCK_D)
 
     cache_len = tl.load(cache_seqlens + pid_t)
     effective_len = (
         tl.minimum(cache_len, window_left + 1) if window_left >= 0 else cache_len
     )
     kv_offset = cache_len - effective_len
-    split_len = (
-        tl.cdiv(tl.cdiv(effective_len, max_kv_splits), _MIN_BLOCK_KV) * _MIN_BLOCK_KV
-    )
+
+    tokens_per_split = tl.cdiv(effective_len, max_kv_splits)
+    split_len = _round_up_to_multiple(tokens_per_split, _MIN_BLOCK_KV)
     split_start = split_len * pid_s
     split_end = tl.minimum(split_start + split_len, effective_len)
 
-    q_offsets = pid_t * stride_q_t + off_h[:, None] * stride_q_h + off_d[None, :]
+    q_offsets = pid_t * stride_q_t + off_q_h[:, None] * stride_q_h + off_q_d[None, :]
+
     row_max = tl.full((BLOCK_H,), float("-inf"), dtype=tl.float32)
     row_sum = tl.zeros((BLOCK_H,), dtype=tl.float32)
     acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
 
     if split_end > split_start:
-        q = tl.load(
-            q_ptr + q_offsets,
-            mask=h_valid[:, None] & d_valid[None, :],
-            other=0.0,
-        )
-        for start_n in range(split_start, split_end, BLOCK_N):
+        q = tl.load(q_ptr + q_offsets)
+
+        for start_n in tl.range(
+            split_start,
+            split_end,
+            BLOCK_N,
+            num_stages=3,
+        ):
             off_n = start_n + tl.arange(0, BLOCK_N)
             n_valid = off_n < split_end
             token_idx = kv_offset + off_n
@@ -155,11 +156,11 @@ def _split_kv_stage1(
                 physical_page[None, :].to(tl.int64) * stride_k_b
                 + page_offset[None, :] * stride_k_p
                 + kv_head * stride_k_h
-                + off_d[:, None] * stride_k_d
+                + off_q_d[:, None] * stride_k_d
             )
             k = tl.load(
                 k_ptr + k_offsets,
-                mask=d_valid[:, None] & n_valid[None, :],
+                mask=n_valid[None, :],
                 other=0.0,
             )
             scores = tl.dot(q, k.to(q.dtype)) * softmax_scale
@@ -169,17 +170,17 @@ def _split_kv_stage1(
             rel_idx = tl.maximum(0, tl.minimum(rel_dist, rel_extent - 1))
             rel_offsets = (
                 pid_t * stride_r_t
-                + off_h[:, None] * stride_r_h
+                + off_q_h[:, None] * stride_r_h
                 + rel_idx[None, :] * stride_r_e
             )
             rel_bias = tl.load(
                 rel_ptr + rel_offsets,
-                mask=h_valid[:, None] & rel_valid[None, :] & n_valid[None, :],
+                mask=rel_valid[None, :] & n_valid[None, :],
                 other=0.0,
             )
             scores += rel_bias.to(tl.float32)
             scores = tl.where(
-                h_valid[:, None] & n_valid[None, :],
+                n_valid[None, :],
                 scores,
                 float("-inf"),
             )
@@ -188,11 +189,11 @@ def _split_kv_stage1(
                 physical_page[:, None].to(tl.int64) * stride_v_b
                 + page_offset[:, None] * stride_v_p
                 + kv_head * stride_v_h
-                + off_d[None, :] * stride_v_d
+                + off_q_d[None, :] * stride_v_d
             )
             v = tl.load(
                 v_ptr + v_offsets,
-                mask=n_valid[:, None] & d_valid[None, :],
+                mask=n_valid[:, None],
                 other=0.0,
             )
 
@@ -200,28 +201,24 @@ def _split_kv_stage1(
             old_scale = tl.exp(row_max - next_max)
             probs = tl.exp(scores - next_max[:, None])
             acc *= old_scale[:, None]
-            acc += tl.dot(probs.to(v.dtype), v)
+            acc = tl.dot(probs.to(v.dtype), v, acc=acc)
             row_sum = row_sum * old_scale + tl.sum(probs, axis=1)
             row_max = next_max
 
         mid_out_offsets = (
             pid_t * stride_mo_t
-            + off_h[:, None] * stride_mo_h
+            + off_q_h[:, None] * stride_mo_h
             + pid_s * stride_mo_s
-            + off_d[None, :]
+            + off_q_d[None, :]
         )
-        tl.store(
-            mid_out_ptr + mid_out_offsets,
-            acc / row_sum[:, None],
-            mask=h_valid[:, None] & d_valid[None, :],
-        )
+        tl.store(mid_out_ptr + mid_out_offsets, acc / row_sum[:, None])
+
         mid_lse_offsets = (
-            pid_t * stride_ml_t + off_h * stride_ml_h + pid_s * stride_ml_s
+            pid_t * stride_ml_t + off_q_h * stride_ml_h + pid_s * stride_ml_s
         )
         tl.store(
             mid_lse_ptr + mid_lse_offsets,
             row_max + tl.log(row_sum),
-            mask=h_valid,
         )
 
 
@@ -243,6 +240,7 @@ def _split_kv_stage2(
     head_dim: tl.constexpr,
     max_kv_splits: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    PADDED_NUM_KV_SPLITS: tl.constexpr,
 ):
     pid_t = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -251,47 +249,39 @@ def _split_kv_stage2(
     effective_len = (
         tl.minimum(cache_len, window_left + 1) if window_left >= 0 else cache_len
     )
-    split_len = (
-        tl.cdiv(tl.cdiv(effective_len, max_kv_splits), _MIN_BLOCK_KV) * _MIN_BLOCK_KV
-    )
+    tokens_per_split = tl.cdiv(effective_len, max_kv_splits)
+    split_len = _round_up_to_multiple(tokens_per_split, _MIN_BLOCK_KV)
 
     off_d = tl.arange(0, BLOCK_D)
     d_valid = off_d < head_dim
-    row_max = -float("inf")
-    row_sum = 0.0
-    acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    offs_s = tl.arange(0, PADDED_NUM_KV_SPLITS)
+    split_start = split_len * offs_s
+    split_valid = (offs_s < max_kv_splits) & (split_start < effective_len)
 
-    for split_id in range(max_kv_splits):
-        split_start = split_len * split_id
-        split_end = tl.minimum(split_start + split_len, effective_len)
-        if split_end > split_start:
-            value = tl.load(
-                mid_out_ptr
-                + pid_t * stride_mo_t
-                + pid_h * stride_mo_h
-                + split_id * stride_mo_s
-                + off_d,
-                mask=d_valid,
-                other=0.0,
-            )
-            split_lse = tl.load(
-                mid_lse_ptr
-                + pid_t * stride_ml_t
-                + pid_h * stride_ml_h
-                + split_id * stride_ml_s
-            )
-            next_max = tl.maximum(split_lse, row_max)
-            old_scale = tl.exp(row_max - next_max)
-            split_scale = tl.exp(split_lse - next_max)
-            acc = acc * old_scale + value * split_scale
-            row_sum = row_sum * old_scale + split_scale
-            row_max = next_max
-
-    tl.store(
-        out_ptr + pid_t * stride_o_t + pid_h * stride_o_h + off_d,
-        acc / row_sum,
-        mask=d_valid,
+    value_offsets = (
+        pid_t * stride_mo_t
+        + pid_h * stride_mo_h
+        + offs_s[:, None] * stride_mo_s
+        + off_d[None, :]
     )
+    value = tl.load(
+        mid_out_ptr + value_offsets,
+        mask=split_valid[:, None] & d_valid[None, :],
+        other=0.0,
+    )
+    split_lse = tl.load(
+        mid_lse_ptr + pid_t * stride_ml_t + pid_h * stride_ml_h + offs_s * stride_ml_s,
+        mask=split_valid,
+        other=-float("inf"),
+    )
+
+    row_max = tl.max(split_lse, axis=0)
+    split_scale = tl.exp(split_lse - row_max)
+    row_sum = tl.sum(split_scale, axis=0)
+    acc = tl.sum(value * split_scale[:, None], axis=0)
+
+    out_offsets = pid_t * stride_o_t + pid_h * stride_o_h + off_d
+    tl.store(out_ptr + out_offsets, acc / row_sum, mask=d_valid)
 
 
 @torch.no_grad()
@@ -313,8 +303,9 @@ def inkling_rel_attention_split_kv_decode(
     num_kv_heads = key_cache.shape[2]
     gqa_group_size = q.shape[1] // num_kv_heads
     max_kv_splits = decode_split_count(max_kv_len, window_left)
+    padded_num_kv_splits = triton.next_power_of_2(max_kv_splits)
     block_d = triton.next_power_of_2(q.shape[2])
-    block_h = min(8, gqa_group_size)
+    block_h = gqa_group_size
 
     mid_out = torch.empty(
         q.shape[0],
@@ -333,7 +324,7 @@ def inkling_rel_attention_split_kv_decode(
     )
     stage1_grid = (
         q.shape[0],
-        triton.cdiv(q.shape[1], block_h),
+        num_kv_heads,
         max_kv_splits,
     )
     _split_kv_stage1[stage1_grid](
@@ -368,16 +359,14 @@ def inkling_rel_attention_split_kv_decode(
         block_table.stride(0),
         page_size=key_cache.shape[1],
         window_left=window_left,
-        gqa_group_size=gqa_group_size,
-        num_q_heads=q.shape[1],
-        head_dim=q.shape[2],
         rel_extent=rel_extent,
         max_kv_splits=max_kv_splits,
         BLOCK_D=block_d,
         BLOCK_H=block_h,
         BLOCK_N=key_cache.shape[1],
         num_warps=4,
-        num_stages=1,
+        matrix_instr_nonkdim=16,
+        waves_per_eu=4,
     )
     stage2_grid = (q.shape[0], q.shape[1])
     _split_kv_stage2[stage2_grid](
@@ -396,6 +385,7 @@ def inkling_rel_attention_split_kv_decode(
         window_left=window_left,
         head_dim=q.shape[2],
         max_kv_splits=max_kv_splits,
+        PADDED_NUM_KV_SPLITS=padded_num_kv_splits,
         BLOCK_D=block_d,
         num_warps=4,
         num_stages=2,
