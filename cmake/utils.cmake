@@ -160,6 +160,10 @@ function (get_torch_gpu_compiler_flags OUT_GPU_FLAGS GPU_LANG)
       "-Werror=unused-variable"
       "-fno-gpu-rdc")
 
+    if(ROCM_VERSION_DEV VERSION_GREATER_EQUAL 7.14)
+      list(APPEND GPU_FLAGS "-Wno-error=unused-variable")
+    endif()
+
   endif()
   set(${OUT_GPU_FLAGS} ${GPU_FLAGS} PARENT_SCOPE)
 endfunction()

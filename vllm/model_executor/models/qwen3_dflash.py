@@ -34,7 +34,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.multimodal.inputs import NestedTensors
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.transformers_utils.repo_utils import get_hf_file_bytes
-from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
@@ -174,6 +174,7 @@ class DFlashQwen3Attention(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         attn_type: str = AttentionType.DECODER,
+        attn_backend: type[AttentionBackend] | None = None,
     ) -> None:
         super().__init__()
         self.layer_name = prefix
@@ -235,6 +236,7 @@ class DFlashQwen3Attention(nn.Module):
             prefix=f"{prefix}.attn",
             attn_type=attn_type,
             sinks=self.attention_sink_bias,
+            attn_backend=attn_backend,
         )
         self.causal = causal
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -303,7 +305,15 @@ class DFlashQwen3DecoderLayer(nn.Module):
         # distilled the other way has to say so here.
         is_neox_style = getattr(config, "is_neox_style", True)
 
-        self.self_attn = DFlashQwen3Attention(
+        from vllm import envs
+
+        attention_cls = DFlashQwen3Attention
+        if envs.VLLM_GFX1151_QWEN_ATTENTION:
+            from .gfx1151_qwen3_5_attention import qwen_attention_cls
+
+            attention_cls = qwen_attention_cls(vllm_config, config, draft=True)
+
+        self.self_attn = attention_cls(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             max_position=config.max_position_embeddings,
@@ -468,6 +478,22 @@ class DFlashQwen3Model(nn.Module):
     ) -> None:
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
+        # Quantized linear methods keep packed weights on the projection's
+        # quant_method instead of exposing a dense ``weight`` parameter. The
+        # cross-layer F.linear fusion is only valid for dense weights; retain
+        # the projections so the fallback can invoke their selected kernels.
+        self._context_qkv_projs = [a.qkv_proj for a in layers_attn]
+        self._use_fused_dense_kv = all(
+            hasattr(proj, "weight") for proj in self._context_qkv_projs
+        )
+        if not self._use_fused_dense_kv:
+            self._fused_kv_weight = None
+            self._fused_kv_bias = None
+            self._k_norm_weights = torch.stack(
+                [a.k_norm.weight.data for a in layers_attn], dim=0
+            ).contiguous()
+            return
+
         # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
         kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
         self._fused_kv_weight = torch.cat(kv_weights, dim=0)
@@ -510,6 +536,7 @@ class DFlashQwen3Model(nn.Module):
 
         # Layer metadata
         self._num_attn_layers = len(layers_attn)
+        self._q_size = attn0.q_size
         self._kv_size = attn0.kv_size
         self._head_dim = attn0.head_dim
         self._num_kv_heads = attn0.num_kv_heads
@@ -542,6 +569,19 @@ class DFlashQwen3Model(nn.Module):
             self._hidden_norm_weight,
             self._rms_norm_eps,
         )
+        if not self._use_fused_dense_kv:
+            per_layer_kv = []
+            for qkv_proj in self._context_qkv_projs:
+                qkv, _ = qkv_proj(normed_context_states)
+                per_layer_kv.append(qkv[:, self._q_size :])
+            all_kv_flat = torch.stack(per_layer_kv, dim=1)
+            all_kv = (
+                all_kv_flat.view(num_ctx, num_layers, 2, num_kv_heads, head_dim)
+                .permute(2, 1, 0, 3, 4)
+                .contiguous()
+            )
+            return all_kv[0], all_kv[1]
+
         all_kv_flat = F.linear(
             normed_context_states, self._fused_kv_weight, self._fused_kv_bias
         )

@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from vllm import _custom_ops as ops
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
@@ -79,6 +80,21 @@ class DFlashGroupedConv(nn.Module):
     def _convolve(
         self, hidden_states: torch.Tensor, delta: torch.Tensor, side: int
     ) -> torch.Tensor:
+        if (
+            self.taps == 2
+            and hidden_states.dtype == torch.bfloat16
+            and hasattr(torch.ops, "_rocm_C")
+            and hasattr(torch.ops._rocm_C, "dflash2_grouped_conv")
+        ):
+            return ops.dflash2_grouped_conv(
+                hidden_states,
+                delta,
+                self.base_kernel,
+                self.block_size,
+                self.group_size,
+                self.num_groups,
+                side,
+            )
         return _grouped_conv(
             hidden_states,
             delta,

@@ -8,15 +8,17 @@ Routes based on batch size M:
   M > MAX_SKINNY_BATCH_SIZE:  Triton W4A16 fused dequant GEMM
 
 Stores the weights ONCE as int8 [N, K//2] (ExLlama shuffle packed). Both
-paths read this single buffer: the HIP skinny kernel uses it directly, and
+paths read this single buffer by default: the HIP skinny kernel uses it directly, and
 the triton kernel reinterprets it as int32 [N, K//8] via a view (and
-transposes tiles in-register). No dual weight storage.
+transposes tiles in-register). The opt-in gfx1151 group-major cache retains
+an additional layout for selected small-batch verification shapes.
 """
 
 from contextlib import nullcontext
 
 import torch
 
+import vllm.envs as envs
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     unpack_quantized_values_into_int32,
 )
@@ -450,8 +452,8 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
 
     Stores the weights once as int8 [N, K//2] (ExLlama shuffle packed). The
     HIP skinny kernel reads it directly; the triton kernel reinterprets the
-    same buffer as int32 [N, K//8] via a view, so there is no dual weight
-    storage.
+    same buffer as int32 [N, K//8] via a view. An optional gfx1151 group-major
+    cache adds derived storage for small-batch verification.
     """
 
     SUPPORTED_QUANT_TYPES = [
@@ -532,6 +534,11 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
         self._transform_param(layer, self.w_q_name, lambda x: w_q_skinny)
         self._transform_param(layer, self.w_s_name, lambda x: w_s_skinny)
 
+        if envs.VLLM_GFX1151_W4_GROUP_MAJOR:
+            from .rdna_w4a16_group_major import prepare_layer
+
+            prepare_layer(layer, *self._get_weight_params(layer), c.group_size)
+
     def apply_weights(
         self,
         layer: torch.nn.Module,
@@ -548,6 +555,23 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
         out_shape = x.shape[:-1] + (N,)
 
         cu_count = num_compute_units()
+        if envs.VLLM_GFX1151_W4_GROUP_MAJOR:
+            from .rdna_w4a16_group_major import Q_BUFFER, S_BUFFER
+
+            grouped_q = getattr(layer, Q_BUFFER, None)
+            grouped_s = getattr(layer, S_BUFFER, None)
+            if grouped_q is not None and grouped_s is not None:
+                return torch.ops.vllm.gfx1151_w4_group_major(
+                    x_2d,
+                    w_q,
+                    w_s,
+                    w_zp,
+                    bias,
+                    cu_count,
+                    c.group_size,
+                    grouped_q,
+                    grouped_s,
+                ).reshape(out_shape)
         output = torch.ops.vllm.rdna_hybrid_w4a16_apply(
             x_2d,
             w_q,

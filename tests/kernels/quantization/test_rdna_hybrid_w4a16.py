@@ -87,6 +87,146 @@ def _rdna_hybrid_w4a16_reference(
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(scope="module", params=[17408, 6144])
+def group_major_probe_weights(request):
+    from benchmarks.kernels import gfx1151_qwen_w4a16_group_major as probe
+
+    if not hybrid_module._on_gfx1151():
+        pytest.skip("Group-major model probe is gfx1151-only")
+    torch.manual_seed(47)
+    n, k = 5120, request.param
+    words = torch.randint(
+        -(2**31), 2**31 - 1, (n, k // 8), dtype=torch.int32, device="cuda"
+    )
+    weights = words.view(torch.int8)
+    scales = (torch.rand((n, k // 128), device="cuda") * 0.05).to(torch.bfloat16)
+    layer = torch.nn.Module()
+    assert probe.prepare_layer(layer, weights, scales, None, 128)
+    with pytest.raises(RuntimeError, match="already has"):
+        probe.prepare_layer(layer, weights, scales, None, 128)
+    assert layer.state_dict() == {}  # Derived cache is non-persistent.
+    q, s = getattr(layer, probe.Q_BUFFER), getattr(layer, probe.S_BUFFER)
+    assert torch.equal(q.permute(1, 0, 2).reshape_as(words), words)
+    assert torch.equal(s.t(), scales)
+    return weights, scales, q, s
+
+
+@pytest.mark.parametrize(
+    "m", [1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 24, 32, 33, 40, 48, 56, 64, 65]
+)
+def test_group_major_registered_probe_matches_original_and_dirty_graph(
+    group_major_probe_weights, m, monkeypatch
+):
+    """Cover partial tiles and fallback boundaries before widening model dispatch."""
+    from benchmarks.kernels import gfx1151_qwen_w4a16_group_major as probe
+    from vllm.utils.platform_utils import num_compute_units
+
+    w, s, gq, gs = group_major_probe_weights
+    k = w.shape[1] * 2
+    torch.manual_seed(100 + m)
+    x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    cu = num_compute_units()
+    expected = torch.ops.vllm.rdna_hybrid_w4a16_apply(x, w, s, None, None, cu, 128)
+    active = probe.can_use(x, w, s, None, None, 128, gq, gs)
+    assert active == (2 <= m <= 64 and not (m <= 5 and m * k <= 32768))
+    op = torch.ops.vllm.gfx1151_w4_group_major_probe
+    for _ in range(3):
+        actual = op(x, w, s, None, None, cu, 128, gq, gs)
+    assert torch.equal(actual, expected)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = op(x, w, s, None, None, cu, 128, gq, gs)
+    actual.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(actual, expected)
+
+    # Run the production op against the same operands, including the fallback
+    # boundaries. Separately prepared caches and reloads are covered below.
+    from vllm.model_executor.kernels.linear.mixed_precision import (
+        rdna_w4a16_group_major as production,  # noqa: F401 (registers custom op)
+    )
+
+    monkeypatch.setenv("VLLM_GFX1151_W4_GROUP_MAJOR", "1")
+    op = torch.ops.vllm.gfx1151_w4_group_major
+    for _ in range(3):
+        actual = op(x, w, s, None, None, cu, 128, gq, gs)
+    assert torch.equal(actual, expected)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = op(x, w, s, None, None, cu, 128, gq, gs)
+    actual.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("layerwise", [False, True])
+def test_group_major_weight_reload_refreshes_captured_storage(
+    group_major_probe_weights, monkeypatch, layerwise
+):
+    """Derived non-persistent buffers must not restore stale values on reload."""
+    from vllm.model_executor.kernels.linear.mixed_precision import (
+        rdna_w4a16_group_major as production,
+    )
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        _copy_and_restore_kernel_tensors,
+        get_layerwise_info,
+    )
+    from vllm.utils.platform_utils import num_compute_units
+
+    monkeypatch.setenv("VLLM_GFX1151_W4_GROUP_MAJOR", "1")
+    w, s, _, _ = group_major_probe_weights
+    layer = torch.nn.Module()
+    layer.register_parameter("w", torch.nn.Parameter(w.clone(), requires_grad=False))
+    layer.register_parameter("s", torch.nn.Parameter(s.clone(), requires_grad=False))
+    assert production.prepare_layer(layer, layer.w, layer.s, None, 128)
+    q = getattr(layer, production.Q_BUFFER)
+    scales = getattr(layer, production.S_BUFFER)
+    pointers = (q.data_ptr(), scales.data_ptr())
+    assert set(layer.state_dict()) == {"w", "s"}
+    torch.manual_seed(49)
+    x = torch.randn((8, w.shape[1] * 2), device=w.device, dtype=torch.bfloat16)
+    op, cu = torch.ops.vllm.gfx1151_w4_group_major, num_compute_units()
+    for _ in range(3):
+        before = op(x, layer.w, layer.s, None, None, cu, 128, q, scales)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = op(x, layer.w, layer.s, None, None, cu, 128, q, scales)
+
+    if layerwise:
+        info = get_layerwise_info(layer)
+        info.kernel_tensors = (
+            dict(layer.named_parameters()),
+            dict(layer.named_buffers()),
+        )
+        info.kernel_non_persistent_buffers = set(layer._non_persistent_buffers_set)
+        # The real reloader restores raw-weight metadata with no derived cache.
+        delattr(layer, production.Q_BUFFER)
+        delattr(layer, production.S_BUFFER)
+        layer.w = torch.nn.Parameter(w.clone().bitwise_xor_(17), requires_grad=False)
+        layer.s = torch.nn.Parameter(s.clone().mul_(0.5), requires_grad=False)
+    else:
+        layer.w.bitwise_xor_(17)
+        layer.s.mul_(0.5)
+    assert production.prepare_layer(layer, layer.w, layer.s, None, 128)
+    if layerwise:
+        _copy_and_restore_kernel_tensors(layer, info)
+        info.reset()
+    assert getattr(layer, production.Q_BUFFER) is q
+    assert getattr(layer, production.S_BUFFER) is scales
+    assert (q.data_ptr(), scales.data_ptr()) == pointers
+    assert set(layer.state_dict()) == {"w", "s"}
+    expected = torch.ops.vllm.rdna_hybrid_w4a16_apply(
+        x, layer.w, layer.s, None, None, cu, 128
+    )
+    assert not torch.equal(before, expected)
+    result.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(result, expected)
+
+
 @pytest.mark.skipif(not on_gfx1x(), reason="Hybrid path is gfx11/gfx12 only")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("group_size", SUPPORTED_GROUP_SIZES)

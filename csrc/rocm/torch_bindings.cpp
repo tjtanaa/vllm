@@ -14,6 +14,46 @@
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   // vLLM custom ops for rocm
 
+  rocm_ops.def(
+      "gfx1151_qwen_gdn_decode_core(Tensor mixed, Tensor a, Tensor b, "
+      "Tensor a_log, Tensor dt_bias, Tensor indices, Tensor starts, "
+      "Tensor accepted, Tensor(s!) state, Tensor(o!) output, float scale, "
+      "Tensor(c!) conv_state, Tensor conv_weight, Tensor? conv_bias) -> ()");
+  rocm_ops.impl("gfx1151_qwen_gdn_decode_core", torch::kCUDA,
+                &gfx1151_qwen_gdn_decode_core);
+
+  rocm_ops.def(
+      "gfx1151_qwen_gdn_decode(Tensor mixed, Tensor a, Tensor b, Tensor a_log, "
+      "Tensor dt_bias, Tensor indices, Tensor starts, Tensor accepted, "
+      "Tensor(s!) state, Tensor gate, Tensor norm_weight, Tensor(o!) output, "
+      "float scale, float epsilon, bool sigmoid_gate, Tensor(c!) conv_state, "
+      "Tensor conv_weight, Tensor? conv_bias) -> ()");
+  rocm_ops.impl("gfx1151_qwen_gdn_decode", torch::kCUDA,
+                &gfx1151_qwen_gdn_decode);
+
+  rocm_ops.def(
+      "gfx1151_qwen_gdn_post_conv(Tensor mixed, Tensor a, Tensor b, Tensor a_log, "
+      "Tensor dt_bias, Tensor indices, Tensor starts, Tensor accepted, "
+      "Tensor(s!) state, Tensor gate, Tensor norm_weight, Tensor(o!) output, "
+      "float scale, float epsilon, bool sigmoid_gate) -> ()");
+  rocm_ops.impl("gfx1151_qwen_gdn_post_conv", torch::kCUDA,
+                &gfx1151_qwen_gdn_post_conv);
+
+  rocm_ops.def(
+      "gfx1151_qwen_paged_attention(Tensor query, Tensor key_cache, "
+      "Tensor value_cache, Tensor block_table, Tensor seq_lens, "
+      "Tensor query_start_loc, Tensor? sinks, Tensor(a!) output, "
+      "Tensor(b!) workspace, int max_seq_len, int max_query_len, float scale, "
+      "int sliding_window, bool causal) -> ()");
+  rocm_ops.impl("gfx1151_qwen_paged_attention", torch::kCUDA,
+                &gfx1151_qwen_paged_attention);
+
+  rocm_ops.def(
+      "dflash2_grouped_conv(Tensor hidden, Tensor delta, Tensor base, "
+      "int block_size, int group_size, int num_groups, int side) -> Tensor");
+  rocm_ops.impl("dflash2_grouped_conv", torch::kCUDA,
+                &dflash2_grouped_conv);
+
 // skinny_gemms.cu (LLMM1/wvSplitK/wvSplitKrc/wvSplitKQ) is excluded on gfx1250
 // (gfx9/gfx11 ISA, unsupported there); skip these registrations to avoid
 // undefined symbols. vLLM uses default/Triton GEMM for these ops on gfx1250.

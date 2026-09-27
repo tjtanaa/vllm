@@ -35,6 +35,38 @@ def test_grouped_conv_matches_reference(block_size: int):
     torch.testing.assert_close(actual, expected.flatten(0, 1).flatten(-2))
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not torch.version.hip
+    or not hasattr(torch.ops, "_rocm_C")
+    or not hasattr(torch.ops._rocm_C, "dflash2_grouped_conv"),
+    reason="requires the ROCm DFlash2 extension",
+)
+def test_rocm_grouped_conv_matches_reference():
+    torch.manual_seed(0)
+    tokens, hidden_size, group_size, taps, block_size = 18, 5120, 16, 2, 9
+    num_groups = hidden_size // group_size
+    hidden = torch.randn(tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+    # Match the production slice from [tokens, 2, taps, num_groups]. Its
+    # token dimension is intentionally non-contiguous.
+    coefficients = torch.randn(
+        tokens, 2, taps, num_groups, device="cuda", dtype=torch.bfloat16
+    )
+    delta = coefficients[:, 0]
+    assert delta.stride() == (2 * taps * num_groups, num_groups, 1)
+    base = torch.randn(2, taps, hidden_size, device="cuda", dtype=torch.bfloat16)
+
+    expected = _grouped_conv(
+        hidden, delta, base[1], block_size, num_groups, group_size, taps
+    )
+    actual = torch.ops._rocm_C.dflash2_grouped_conv(
+        hidden, delta, base, block_size, group_size, num_groups, 1
+    )
+
+    mismatch = ~torch.isclose(actual, expected, rtol=1e-2, atol=1e-2)
+    assert mismatch.float().mean().item() < 0.05
+
+
 def test_selector_edges_match_sequential_reference():
     torch.manual_seed(1)
     batch, steps, top_k, rank = 2, 4, 3, 5

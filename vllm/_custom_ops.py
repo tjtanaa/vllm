@@ -661,6 +661,189 @@ def gptq_gemm_rdna3(
     )
 
 
+def gfx1151_qwen_gdn_decode_core(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_indices: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    state: torch.Tensor,
+    out: torch.Tensor,
+    scale: float,
+    conv_state: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Fused M1 convolution/recurrence; leave normalization to the model."""
+    torch.ops._rocm_C.gfx1151_qwen_gdn_decode_core(
+        mixed_qkv,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state_indices,
+        cu_seqlens,
+        num_accepted_tokens,
+        state,
+        out,
+        scale,
+        conv_state,
+        conv_weight,
+        conv_bias,
+    )
+    return out
+
+
+def gfx1151_qwen_gdn_decode(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_indices: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    state: torch.Tensor,
+    output_gate: torch.Tensor,
+    norm_weight: torch.Tensor,
+    out: torch.Tensor,
+    scale: float,
+    norm_eps: float,
+    conv_state: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_bias: torch.Tensor | None = None,
+    output_gate_activation: str = "silu",
+) -> torch.Tensor:
+    if output_gate_activation not in ("silu", "sigmoid"):
+        raise ValueError("GDN output gate must be silu or sigmoid")
+    torch.ops._rocm_C.gfx1151_qwen_gdn_decode(
+        mixed_qkv,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state_indices,
+        cu_seqlens,
+        num_accepted_tokens,
+        state,
+        output_gate,
+        norm_weight,
+        out,
+        scale,
+        norm_eps,
+        output_gate_activation == "sigmoid",
+        conv_state,
+        conv_weight,
+        conv_bias,
+    )
+    return out
+
+
+def gfx1151_qwen_gdn_post_conv(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_indices: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    state: torch.Tensor,
+    output_gate: torch.Tensor,
+    norm_weight: torch.Tensor,
+    out: torch.Tensor,
+    scale: float,
+    norm_eps: float,
+    output_gate_activation: str = "silu",
+) -> torch.Tensor:
+    if output_gate_activation not in ("silu", "sigmoid"):
+        raise ValueError("GDN output gate must be silu or sigmoid")
+    torch.ops._rocm_C.gfx1151_qwen_gdn_post_conv(
+        mixed_qkv,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state_indices,
+        cu_seqlens,
+        num_accepted_tokens,
+        state,
+        output_gate,
+        norm_weight,
+        out,
+        scale,
+        norm_eps,
+        output_gate_activation == "sigmoid",
+    )
+    return out
+
+
+def gfx1151_qwen_paged_attention(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    sinks: torch.Tensor | None,
+    output: torch.Tensor,
+    workspace: torch.Tensor,
+    max_seq_len: int,
+    max_query_len: int,
+    scale: float,
+    sliding_window: int,
+    causal: bool,
+) -> None:
+    torch.ops._rocm_C.gfx1151_qwen_paged_attention(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        seq_lens,
+        query_start_loc,
+        sinks,
+        output,
+        workspace,
+        max_seq_len,
+        max_query_len,
+        scale,
+        sliding_window,
+        causal,
+    )
+
+
+def dflash2_grouped_conv(
+    hidden: torch.Tensor,
+    delta: torch.Tensor,
+    base: torch.Tensor,
+    block_size: int,
+    group_size: int,
+    num_groups: int,
+    side: int,
+) -> torch.Tensor:
+    return torch.ops._rocm_C.dflash2_grouped_conv(
+        hidden, delta, base, block_size, group_size, num_groups, side
+    )
+
+
+if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "dflash2_grouped_conv"):
+
+    @register_fake("_rocm_C::dflash2_grouped_conv")
+    def _dflash2_grouped_conv_fake(
+        hidden: torch.Tensor,
+        delta: torch.Tensor,
+        base: torch.Tensor,
+        block_size: int,
+        group_size: int,
+        num_groups: int,
+        side: int,
+    ) -> torch.Tensor:
+        return torch.empty_like(hidden)
+
+
 if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "gptq_gemm_rdna3"):
 
     @register_fake("_rocm_C::gptq_gemm_rdna3")

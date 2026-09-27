@@ -43,6 +43,19 @@ def test_api_key_is_not_compile_factor(monkeypatch: pytest.MonkeyPatch):
     assert "VLLM_API_KEY" not in envs.compile_factors()
 
 
+def test_group_major_dispatch_is_default_off_and_changes_compile_factors(monkeypatch):
+    """A cached original graph must not bypass the opt-in weight-cache path."""
+    name = "VLLM_GFX1151_W4_GROUP_MAJOR"
+    monkeypatch.delenv(name, raising=False)
+    assert getattr(envs, name) is False
+    before = envs.compile_factors()
+    monkeypatch.setenv(name, "1")
+    assert getattr(envs, name) is True
+    after = envs.compile_factors()
+    assert before[name] is False and after[name] is True
+    assert before != after
+
+
 def test_p2p_side_channel_defaults_and_override(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_HOST", raising=False)
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_PORT", raising=False)

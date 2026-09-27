@@ -132,6 +132,9 @@ if TYPE_CHECKING:
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
     VLLM_ROCM_USE_AITER: bool = False
+    VLLM_GFX1151_QWEN_ATTENTION: bool = False
+    VLLM_GFX1151_QWEN_GDN: bool = False
+    VLLM_GFX1151_W4_GROUP_MAJOR: bool = False
     VLLM_ROCM_USE_AITER_CUSTOM_AR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
@@ -1230,6 +1233,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_ROCM_USE_AITER": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER", "False").lower() in ("true", "1")
+    ),
+    # Experimental model-local Qwen gfx1151 backend. Restart to change dispatch.
+    "VLLM_GFX1151_QWEN_ATTENTION": lambda: (
+        os.getenv("VLLM_GFX1151_QWEN_ATTENTION", "0").lower() in ("true", "1")
+    ),
+    # Separate experimental GDN gate until numerical and serving validation.
+    "VLLM_GFX1151_QWEN_GDN": lambda: (
+        os.getenv("VLLM_GFX1151_QWEN_GDN", "0").lower() in ("true", "1")
+    ),
+    # Experimental derived W4 cache (~11.68 GiB for Qwen 27B). Restart to change.
+    "VLLM_GFX1151_W4_GROUP_MAJOR": lambda: (
+        os.getenv("VLLM_GFX1151_W4_GROUP_MAJOR", "0").lower() in ("true", "1")
     ),
     # Use AITER's CustomAllreduce as the custom-allreduce backend inside vLLM's
     # CudaCommunicator on ROCm. Also enables AITER AG/RS for DP communication.

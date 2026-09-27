@@ -2,6 +2,41 @@
 
 #include <torch/all.h>
 
+void gfx1151_qwen_gdn_decode_core(
+    const torch::Tensor& mixed, const torch::Tensor& a, const torch::Tensor& b,
+    const torch::Tensor& a_log, const torch::Tensor& dt_bias,
+    const torch::Tensor& indices, const torch::Tensor& starts,
+    const torch::Tensor& accepted, torch::Tensor& state,
+    torch::Tensor& output, double scale, torch::Tensor& conv_state,
+    const torch::Tensor& conv_weight,
+    const std::optional<torch::Tensor>& conv_bias);
+
+void gfx1151_qwen_gdn_decode(
+    const torch::Tensor& mixed, const torch::Tensor& a, const torch::Tensor& b,
+    const torch::Tensor& a_log, const torch::Tensor& dt_bias,
+    const torch::Tensor& indices, const torch::Tensor& starts,
+    const torch::Tensor& accepted, torch::Tensor& state,
+    const torch::Tensor& gate, const torch::Tensor& norm_weight,
+    torch::Tensor& output, double scale, double epsilon, bool sigmoid_gate,
+    torch::Tensor& conv_state, const torch::Tensor& conv_weight,
+    const std::optional<torch::Tensor>& conv_bias);
+
+void gfx1151_qwen_gdn_post_conv(
+    const torch::Tensor& mixed, const torch::Tensor& a, const torch::Tensor& b,
+    const torch::Tensor& a_log, const torch::Tensor& dt_bias,
+    const torch::Tensor& indices, const torch::Tensor& starts,
+    const torch::Tensor& accepted, torch::Tensor& state,
+    const torch::Tensor& gate, const torch::Tensor& norm_weight,
+    torch::Tensor& output, double scale, double epsilon, bool sigmoid_gate);
+
+void gfx1151_qwen_paged_attention(
+    const torch::Tensor& query, const torch::Tensor& key_cache,
+    const torch::Tensor& value_cache, const torch::Tensor& block_table,
+    const torch::Tensor& seq_lens, const torch::Tensor& query_start_loc,
+    const std::optional<torch::Tensor>& sinks, torch::Tensor& output,
+    torch::Tensor& workspace, int64_t max_seq_len, int64_t max_query_len,
+    double scale, int64_t sliding_window, bool causal);
+
 torch::Tensor LLMM1(at::Tensor& in_a, at::Tensor& in_b,
                     const int64_t rows_per_block);
 
@@ -23,6 +58,11 @@ void wvSplitKQ(const at::Tensor& in_a, const at::Tensor& in_b,
                const std::optional<at::Tensor>& in_bias, at::Tensor& out_c,
                const at::Tensor& scale_a, const at::Tensor& scale_b,
                const int64_t CuCount);
+
+torch::Tensor dflash2_grouped_conv(
+    const torch::Tensor& hidden, const torch::Tensor& delta,
+    const torch::Tensor& base, int64_t block_size, int64_t group_size,
+    int64_t num_groups, int64_t side);
 
 torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
                               torch::Tensor b_qzeros, torch::Tensor b_scales,

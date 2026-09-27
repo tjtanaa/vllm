@@ -32,7 +32,7 @@ import time
 import uuid
 import warnings
 from collections.abc import AsyncGenerator, Iterable, Iterator
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -1295,6 +1295,10 @@ async def benchmark(
             "total_token_throughput": metrics.total_token_throughput,
             "input_lens": [output.prompt_len for output in outputs],
             "output_lens": actual_output_lens,
+            # Preserve whether calculate_metrics used an endpoint count or its
+            # tokenizer fallback. In particular, missing usage must not appear
+            # to be an independently verified server token count.
+            "reported_output_lens": [output.output_tokens for output in outputs],
             "ttfts": [output.ttft for output in outputs],
             "itls": [output.itl for output in outputs],
             "latencies": [output.latency for output in outputs],
@@ -1338,6 +1342,19 @@ async def benchmark(
     if rps_change_events:
         result["rps_change_events"] = rps_change_events
 
+    # These snapshots were already fetched outside the timed request interval.
+    # Keep missing snapshots distinct from zero counters and expose resets for
+    # offline auditing; do not add requests or change the existing statistics.
+    result["spec_decode_metrics_before"] = (
+        asdict(spec_decode_metrics_before)
+        if spec_decode_metrics_before is not None
+        else None
+    )
+    result["spec_decode_metrics_after"] = (
+        asdict(spec_decode_metrics_after)
+        if spec_decode_metrics_after is not None
+        else None
+    )
     if spec_decode_stats is not None:
         result["spec_decode_acceptance_rate"] = spec_decode_stats["acceptance_rate"]
         result["spec_decode_acceptance_length"] = spec_decode_stats["acceptance_length"]
@@ -2397,6 +2414,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         for field in [
             "input_lens",
             "output_lens",
+            "reported_output_lens",
             "start_times",
             "ttfts",
             "itls",

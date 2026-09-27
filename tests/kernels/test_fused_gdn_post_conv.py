@@ -387,3 +387,442 @@ def test_fused_gdn_decode_post_conv_mtp_head_ratios(
         )
 
     torch.testing.assert_close(state_actual, state_ref, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.parametrize("batch", [1, 2, 4, 8])
+@pytest.mark.parametrize(
+    "width,fuse_conv,raw_core",
+    [
+        (width, fuse_conv, False)
+        for width in (1, 4, 8, 16, 24, 32)
+        for fuse_conv in (False, True)
+    ]
+    + [pytest.param(1, True, True, id="raw_core")],
+)
+@pytest.mark.parametrize("unaligned_state", [False, True])
+@pytest.mark.parametrize(
+    "state_dtype, parameter_dtype, activation",
+    [
+        (torch.float32, torch.float32, "silu"),
+        (torch.bfloat16, torch.bfloat16, "sigmoid"),
+        pytest.param(torch.float32, torch.bfloat16, "silu", id="production_mixed"),
+    ],
+)
+@torch.inference_mode()
+def test_gfx1151_gdn_post_conv_states_strides_and_graph(
+    batch,
+    width,
+    fuse_conv,
+    raw_core,
+    unaligned_state,
+    state_dtype,
+    parameter_dtype,
+    activation,
+):
+    """Preserve speculative states and BF16-before-norm semantics on wave32.
+
+    Exercise packed projections, padded slots, ragged requests, an aliased
+    source/destination slot, and replay from dirty output against Triton.
+    A separate FP32 recurrence checks the baseline's numerical error floor.
+    """
+    if not torch.version.hip:
+        pytest.skip("gfx1151 HIP kernel")
+    if torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] != "gfx1151":
+        pytest.skip("gfx1151 HIP kernel")
+    op_name = "gfx1151_qwen_gdn_decode" if fuse_conv else "gfx1151_qwen_gdn_post_conv"
+    if raw_core:
+        op_name = "gfx1151_qwen_gdn_decode_core"
+    if not hasattr(torch.ops._rocm_C, op_name):
+        pytest.skip("gfx1151 GDN op is not built")
+    torch.manual_seed(29)
+    H, HV, D = 16, 48, 128
+    lengths = [width if i == 0 else max(1, width - i) for i in range(batch)]
+    if batch > 2:
+        lengths[-1] = 0
+    tokens = sum(lengths)
+    slots = batch * width + 1
+    scale, eps = D**-0.5, 1e-6
+    packed = torch.randn(
+        tokens, (2 * H + 2 * HV) * D, device="cuda", dtype=torch.bfloat16
+    )
+    mixed = packed[:, : (2 * H + HV) * D]
+    gate = packed[:, (2 * H + HV) * D :].view(tokens, HV, D)
+    b, a = torch.randn(tokens, 2 * HV, device="cuda", dtype=torch.bfloat16).chunk(2, -1)
+    A_log = torch.randn(HV, device="cuda") * 0.5
+    dt_bias = (torch.randn(HV, device="cuda") * 0.1).to(parameter_dtype)
+    weight = torch.randn(D, device="cuda", dtype=parameter_dtype)
+    channels = (2 * H + HV) * D
+    conv_weights = torch.randn(channels, 4, device="cuda", dtype=torch.bfloat16) * 0.1
+    conv_bias = (
+        torch.randn(channels, device="cuda", dtype=torch.bfloat16) * 0.1
+        if activation == "sigmoid"
+        else None
+    )
+    conv_initial = torch.randn(
+        slots, channels, width + 2, device="cuda", dtype=torch.bfloat16
+    )
+    if state_dtype == torch.float32:
+        conv_storage = torch.full(
+            (slots, channels + 16, width + 3),
+            float("nan"),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+    else:
+        conv_storage = torch.full(
+            (slots, width + 3, channels + 16),
+            float("nan"),
+            device="cuda",
+            dtype=torch.bfloat16,
+        ).transpose(-1, -2)
+    conv_actual = conv_storage[:, :channels, : width + 2]
+    initial = (torch.randn(slots, HV, D, D, device="cuda") * 0.01).to(state_dtype)
+    # Exercise packed stores and the unaligned-pointer/slot-stride fallback.
+    # Prefix and slot padding must not be read or written by either path.
+    state_offset = int(unaligned_state)
+    storage = torch.full(
+        (slots, HV * D * D + 32 + state_offset),
+        float("nan"),
+        device="cuda",
+        dtype=state_dtype,
+    )
+    actual_state = storage[:, state_offset : state_offset + HV * D * D].view(
+        slots, HV, D, D
+    )
+    indices = torch.arange(1, slots, device="cuda", dtype=torch.int32).view(
+        batch, width
+    )
+    starts = torch.tensor(
+        [0, *torch.tensor(lengths).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+    )
+    accepted = torch.ones(batch, device="cuda", dtype=torch.int32)
+    output = torch.empty(tokens, HV, D, device="cuda", dtype=torch.bfloat16)
+
+    def run():
+        if raw_core:
+            return ops.gfx1151_qwen_gdn_decode_core(
+                mixed,
+                a,
+                b,
+                A_log,
+                dt_bias,
+                indices,
+                starts,
+                accepted,
+                actual_state,
+                output,
+                scale,
+                conv_actual,
+                conv_weights,
+                conv_bias,
+            )
+        if fuse_conv:
+            return ops.gfx1151_qwen_gdn_decode(
+                mixed,
+                a,
+                b,
+                A_log,
+                dt_bias,
+                indices,
+                starts,
+                accepted,
+                actual_state,
+                gate,
+                weight,
+                output,
+                scale,
+                eps,
+                conv_actual,
+                conv_weights,
+                conv_bias,
+                activation,
+            )
+        return ops.gfx1151_qwen_gdn_post_conv(
+            mixed,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            indices,
+            starts,
+            accepted,
+            actual_state,
+            gate,
+            weight,
+            output,
+            scale,
+            eps,
+            activation,
+        )
+
+    for accepted_count in sorted({1, width}):
+        accepted.fill_(accepted_count)
+        state_ref = initial.clone()
+        actual_state.copy_(initial)
+        conv_actual.copy_(conv_initial)
+        conv_ref = conv_initial.clone()
+        post_conv = mixed
+        if fuse_conv:
+            from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+                causal_conv1d_update,
+            )
+
+            post_conv = causal_conv1d_update(
+                mixed,
+                conv_ref,
+                conv_weights,
+                conv_bias,
+                "silu",
+                conv_state_indices=indices[:, 0],
+                num_accepted_tokens=accepted,
+                query_start_loc=starts,
+                max_query_len=width,
+                out=torch.empty_like(mixed),
+            )
+        query, key, value = torch.split(post_conv, [H * D, H * D, HV * D], -1)
+        raw_ref, _ = fused_sigmoid_gating_delta_rule_update(
+            A_log=A_log,
+            a=a,
+            b=b,
+            dt_bias=dt_bias,
+            q=query.reshape(1, tokens, H, D),
+            k=key.reshape(1, tokens, H, D),
+            v=value.reshape(1, tokens, HV, D),
+            initial_state=state_ref,
+            inplace_final_state=True,
+            cu_seqlens=starts,
+            ssm_state_indices=indices,
+            num_accepted_tokens=accepted,
+            scale=scale,
+            use_qk_l2norm_in_kernel=True,
+        )
+        expected = rmsnorm_fn(
+            raw_ref.squeeze(0),
+            weight,
+            None,
+            z=gate,
+            eps=eps,
+            norm_before_gate=True,
+            activation=activation,
+        )
+        if raw_core:
+            expected = raw_ref.squeeze(0)
+        run()
+        eager = output.clone()
+        # Warm up outside capture, restore the input state before each replay.
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            actual_state.copy_(initial)
+            conv_actual.copy_(conv_initial)
+            run()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        actual_state.copy_(initial)
+        conv_actual.copy_(conv_initial)
+        output.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.isfinite(output).all()
+        torch.testing.assert_close(output, eager, rtol=0, atol=0)
+        output_error = (
+            output.float() - expected.float()
+        ).norm() / expected.float().norm()
+        state_error = (
+            actual_state.float() - state_ref.float()
+        ).norm() / state_ref.float().norm()
+        assert torch.isnan(storage[:, :state_offset]).all()
+        assert torch.isnan(storage[:, state_offset + HV * D * D :]).all()
+        torch.testing.assert_close(actual_state[0], initial[0], rtol=0, atol=0)
+        if fuse_conv:
+            torch.testing.assert_close(conv_actual, conv_ref, rtol=0, atol=0)
+            assert torch.isnan(conv_storage[:, channels:]).all()
+            assert torch.isnan(conv_storage[:, :channels, width + 2 :]).all()
+
+        # Independent FP32 math for the first request/value head. Do not use
+        # BF16 intermediate state between tokens; only stored snapshots round.
+        h = initial[accepted_count, 0].float().clone()
+        high_precision = []
+        if fuse_conv:
+            reference_channels = torch.cat(
+                [
+                    torch.arange(D, device="cuda") + offset
+                    for offset in (0, H * D, 2 * H * D)
+                ]
+            )
+            history = conv_initial[
+                1, reference_channels, accepted_count - 1 : accepted_count + 2
+            ].float()
+            taps = conv_weights[reference_channels].float()
+        for t in range(width):
+            if fuse_conv:
+                x = mixed[t, reference_channels].float()
+                window = torch.cat((history, x[:, None]), dim=1)
+                acc = (
+                    torch.zeros_like(x)
+                    if conv_bias is None
+                    else conv_bias[reference_channels].float().clone()
+                )
+                # Independent BF16 round-to-nearest products, then FP32 math.
+                # The executed gfx1151 Triton BF16-dot lowering can differ;
+                # measure its error floor against this reference as well.
+                for tap in range(4):
+                    acc += (window[:, tap] * taps[:, tap]).to(torch.bfloat16).float()
+                q, k, v = F.silu(acc).to(torch.bfloat16).float().split(D)
+                history = window[:, 1:]
+            else:
+                q = query[t, :D].float()
+                k = key[t, :D].float()
+                v = value[t, :D].float()
+            q = q * torch.rsqrt(q.square().sum() + 1e-6) * scale
+            k = k * torch.rsqrt(k.square().sum() + 1e-6)
+            decay = torch.exp(
+                -A_log[0].exp() * F.softplus(a[t, 0].float() + dt_bias[0].float())
+            )
+            h *= decay
+            delta = (v - h @ k) * b[t, 0].float().sigmoid()
+            h += delta[:, None] * k[None, :]
+            raw = (h @ q).to(torch.bfloat16).float()
+            z = gate[t, 0].float()
+            activated = z.sigmoid() if activation == "sigmoid" else F.silu(z)
+            high_precision.append(
+                (
+                    raw
+                    if raw_core
+                    else raw
+                    * torch.rsqrt(raw.square().mean() + eps)
+                    * weight.float()
+                    * activated
+                ).to(torch.bfloat16)
+            )
+        high_precision = torch.stack(high_precision).float()
+        norm = high_precision.norm().clamp_min(1e-20)
+        baseline_error = (expected[:width, 0].float() - high_precision).norm() / norm
+        candidate_error = (output[:width, 0].float() - high_precision).norm() / norm
+        assert output_error.item() < 5e-4, (
+            f"Output relative L2={output_error.item():.8g}, "
+            f"state relative L2={state_error.item():.8g}; independent FP32 "
+            f"first-head errors: baseline={baseline_error.item():.8g}, "
+            f"candidate={candidate_error.item():.8g}"
+        )
+        assert state_error.item() < 5e-4
+        assert candidate_error < max(5e-4, 2 * baseline_error.item())
+
+        if width == 1:
+            # The live nonspeculative model uses packed decode, not the general
+            # recurrence above. Check its separate lowering on the same inputs.
+            from vllm.third_party.flash_linear_attention.ops.fused_recurrent import (
+                fused_recurrent_gated_delta_rule_packed_decode,
+            )
+
+            packed_state = initial.clone()
+            packed_raw = torch.empty(
+                tokens, 1, HV, D, device="cuda", dtype=torch.bfloat16
+            )
+            fused_recurrent_gated_delta_rule_packed_decode(
+                mixed_qkv=post_conv,
+                a=a,
+                b=b,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                scale=scale,
+                initial_state=packed_state,
+                out=packed_raw,
+                # M=1 has one token per active request; only the final request
+                # may be empty in this fixture and must not enter packed decode.
+                ssm_state_indices=indices[:tokens, 0],
+                use_qk_l2norm_in_kernel=True,
+            )
+            packed_expected = rmsnorm_fn(
+                packed_raw.squeeze(1),
+                weight,
+                None,
+                z=gate,
+                eps=eps,
+                norm_before_gate=True,
+                activation=activation,
+            )
+            if raw_core:
+                packed_expected = packed_raw.squeeze(1)
+            packed_output_error = (output.float() - packed_expected.float()).norm()
+            packed_output_error /= packed_expected.float().norm().clamp_min(1e-20)
+            packed_state_error = (actual_state.float() - packed_state.float()).norm()
+            packed_state_error /= packed_state.float().norm().clamp_min(1e-20)
+            assert packed_output_error.item() < 5e-4, (
+                f"Packed-decode output relative L2={packed_output_error.item():.8g}; "
+                f"state relative L2={packed_state_error.item():.8g}"
+            )
+            assert packed_state_error.item() < 5e-4
+
+    # NULL_BLOCK_ID sources produce zeros and never mutate state; requests
+    # without tokens are no-ops. The generic Triton op leaves invalid output
+    # uninitialized, so check this safety contract directly instead.
+    indices.zero_()
+    actual_state.copy_(initial)
+    conv_actual.copy_(conv_initial)
+    output.fill_(float("nan"))
+    run()
+    assert torch.count_nonzero(output) == 0
+    torch.testing.assert_close(actual_state, initial, rtol=0, atol=0)
+    torch.testing.assert_close(conv_actual, conv_initial, rtol=0, atol=0)
+    if raw_core:
+        # Raw-core is an M1-only API; reject MTP before launch.
+        with pytest.raises(RuntimeError, match="raw GDN decode requires.*M=1"):
+            ops.gfx1151_qwen_gdn_decode_core(
+                mixed,
+                a,
+                b,
+                A_log,
+                dt_bias,
+                indices.expand(batch, 2).contiguous(),
+                starts,
+                accepted,
+                actual_state,
+                output,
+                scale,
+                conv_actual,
+                conv_weights,
+                conv_bias,
+            )
+    if fuse_conv:
+        with pytest.raises(RuntimeError, match="convolution state requires"):
+            ops.gfx1151_qwen_gdn_decode(
+                mixed,
+                a,
+                b,
+                A_log,
+                dt_bias,
+                indices,
+                starts,
+                accepted,
+                actual_state,
+                gate,
+                weight,
+                output,
+                scale,
+                eps,
+                conv_actual[:, :, : width + 1],
+                conv_weights,
+                conv_bias,
+                activation,
+            )
+    with pytest.raises(RuntimeError, match="contiguous channels"):
+        ops.gfx1151_qwen_gdn_post_conv(
+            mixed[:, ::2],
+            a,
+            b,
+            A_log,
+            dt_bias,
+            indices,
+            starts,
+            accepted,
+            actual_state,
+            gate,
+            weight,
+            output,
+            scale,
+            eps,
+            activation,
+        )

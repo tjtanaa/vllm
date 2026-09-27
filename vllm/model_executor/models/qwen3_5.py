@@ -142,7 +142,15 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         )
 
         if self.layer_type == "linear_attention":
-            self.linear_attn = QwenGatedDeltaNetAttention(
+            from vllm import envs
+
+            gdn_cls = QwenGatedDeltaNetAttention
+            if envs.VLLM_GFX1151_QWEN_GDN:
+                from .gfx1151_qwen3_5_attention import qwen_gdn_cls
+
+                gdn_cls = qwen_gdn_cls(vllm_config, config)
+
+            self.linear_attn = gdn_cls(
                 config=config,
                 vllm_config=vllm_config,
                 prefix=f"{prefix}.linear_attn",
@@ -150,7 +158,15 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 reduce_results=not self.use_attn_reduce_scatter_for_moe,
             )
         elif self.layer_type == "full_attention":
-            self.self_attn = Qwen3NextAttention(
+            from vllm import envs
+
+            attention_cls = Qwen3NextAttention
+            if envs.VLLM_GFX1151_QWEN_ATTENTION:
+                from .gfx1151_qwen3_5_attention import qwen_attention_cls
+
+                attention_cls = qwen_attention_cls(vllm_config, config)
+
+            self.self_attn = attention_cls(
                 config,
                 model_config=model_config,
                 cache_config=cache_config,
