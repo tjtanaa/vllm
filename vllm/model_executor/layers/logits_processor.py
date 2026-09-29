@@ -141,6 +141,14 @@ class LogitsProcessor(PluggableLayer):
     ) -> torch.Tensor:
         """Project hidden states through the lm_head, honoring head_dtype."""
         if self.head_dtype is None or self.head_dtype == hidden_states.dtype:
+            # Opt-in gfx1151 path: derived int4 head plus exact top-K reranking.
+            # It reads 4x fewer weight bytes per call, which dominates small
+            # decode batches; rows outside the top-K are masked to -inf.
+            from vllm.model_executor.layers import gfx1151_w4_logits
+
+            fast = gfx1151_w4_logits.apply(lm_head, hidden_states, embedding_bias)
+            if fast is not None:
+                return fast
             return lm_head.quant_method.apply(
                 lm_head, hidden_states, bias=embedding_bias
             )

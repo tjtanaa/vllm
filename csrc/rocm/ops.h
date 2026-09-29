@@ -50,6 +50,13 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_a, const at::Tensor& in_b,
                               const std::optional<at::Tensor>& in_bias,
                               const int64_t CuCount, const int64_t group_size);
 
+torch::Tensor wvSplitK_int4_lds_tile_g(const at::Tensor& in_a,
+                                       const at::Tensor& in_b,
+                                       const at::Tensor& in_scale,
+                                       const int64_t ytile,
+                                       const int64_t wvprgrp,
+                                       const int64_t unrl, const int64_t kt);
+
 torch::Tensor wvSplitKrc(const at::Tensor& in_a, const at::Tensor& in_b,
                          const std::optional<at::Tensor>& in_bias,
                          const int64_t CuCount);

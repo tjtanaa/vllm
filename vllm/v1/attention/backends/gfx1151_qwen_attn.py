@@ -22,6 +22,10 @@ from vllm.v1.attention.backends.rocm_attn import (
     RocmAttentionMetadataBuilder,
 )
 from vllm.v1.attention.ops.gfx1151_qwen_prefill import gfx1151_qwen_prefill
+from vllm.v1.attention.ops.gfx1151_verify_splitkv import (
+    splitkv_supports,
+    splitkv_verify_attention,
+)
 from vllm.v1.attention.ops.paged_attn import PagedAttention
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
@@ -29,10 +33,48 @@ from vllm.v1.worker.workspace import (
 )
 
 logger = init_logger(__name__)
+# Delivered longest context for the tuned paths; VLLM_GFX1151_QWEN_MAX_CONTEXT
+# raises it per process. See the comment in vllm/envs.py: a value below
+# --max-model-len silently disables every tuned gfx1151 attention path, because
+# CUDA-graph capture uses max_seq_len = max_model_len.
 MAX_CONTEXT = 4096
 MAX_BATCH = 8
 MAX_QUERY = 32
 PARTITION_SIZE = 256
+# Tile shipped before the in-situ measurement below; kept for A/B runs.
+LEGACY_VERIFY_TILE = (16, 64, 4)
+_VERIFY_TILE: tuple[int, int, int] | None = None
+
+
+def _verification_tile() -> tuple[int, int, int]:
+    """(BLOCK_M, BLOCK_N, num_warps) for cached-prefix verification attention.
+
+    Measured with benchmarks/kernels/bench_gfx1151_attention_in_situ.py, which
+    reproduces serving conditions (16 GiB scattered page pool, L2 flushed by the
+    surrounding weight streaming). At a 1.4K context the legacy 16/64/4 tile
+    costs ~870 us per layer versus ~410 us for 16/128/8: the verification grid
+    is only one workgroup per query head, so eight warps are needed to hide
+    paged-KV latency once the L2 is cold.
+    """
+    global _VERIFY_TILE
+    if _VERIFY_TILE is None:
+        raw = str(envs.VLLM_GFX1151_QWEN_VERIFY_TILE).strip()
+        if raw.lower() in ("legacy", "0", ""):
+            _VERIFY_TILE = LEGACY_VERIFY_TILE
+        else:
+            try:
+                parts = tuple(int(v) for v in raw.split(","))
+                if len(parts) != 3 or min(parts) <= 0:
+                    raise ValueError(raw)
+                _VERIFY_TILE = parts  # type: ignore[assignment]
+            except ValueError:
+                logger.warning_once(
+                    "Ignoring invalid VLLM_GFX1151_QWEN_VERIFY_TILE=%r; using %s",
+                    raw,
+                    LEGACY_VERIFY_TILE,
+                )
+                _VERIFY_TILE = LEGACY_VERIFY_TILE
+    return _VERIFY_TILE
 
 
 def supports_gfx1151_qwen_config(vllm_config: VllmConfig, config) -> bool:
@@ -144,10 +186,15 @@ class Gfx1151QwenAttentionImpl(RocmAttentionImpl):
             self._enabled = supports_gfx1151_qwen_config(
                 config, config.speculative_config.draft_model_config.hf_config
             )
+        self._max_context = max(MAX_CONTEXT, envs.VLLM_GFX1151_QWEN_MAX_CONTEXT)
         self._workspace_shape = (
             min(config.scheduler_config.max_num_seqs, MAX_BATCH) * MAX_QUERY,
             self.num_heads,
-            (min(config.model_config.max_model_len, MAX_CONTEXT) + PARTITION_SIZE - 1)
+            (
+                min(config.model_config.max_model_len, self._max_context)
+                + PARTITION_SIZE
+                - 1
+            )
             // PARTITION_SIZE,
             self.head_size + 2,
         )
@@ -163,7 +210,7 @@ class Gfx1151QwenAttentionImpl(RocmAttentionImpl):
         ):
             return False
         if (
-            not 1024 <= metadata.max_seq_len <= MAX_CONTEXT
+            not 1024 <= metadata.max_seq_len <= self._max_context
             or not 1 <= metadata.seq_lens.numel() <= MAX_BATCH
             or metadata.num_actual_tokens <= 0
             or metadata.num_partitions
@@ -292,7 +339,7 @@ class Gfx1151QwenAttentionImpl(RocmAttentionImpl):
             or self.sliding_window[0] > 0
             or not (
                 metadata.max_query_len in (4, 8, 16, 24, 32)
-                or 1024 <= metadata.max_query_len <= MAX_CONTEXT
+                or 1024 <= metadata.max_query_len <= self._max_context
             )
             or metadata.max_query_len > metadata.max_seq_len
         ):
@@ -371,10 +418,55 @@ class Gfx1151QwenAttentionImpl(RocmAttentionImpl):
             draft = self.head_size == 128
             width = attn_metadata.max_query_len
             cached_verification = draft or width in (4, 8, 16, 32)
+            if (
+                cached_verification
+                and not draft
+                and envs.VLLM_GFX1151_QWEN_VERIFY_SPLITKV
+                # Measured: 128.8 -> 125.4 ms/step at concurrency 1, but
+                # neutral-to-slightly-worse at concurrency 4 (253.7 -> 257.2 ms),
+                # where the prefix path already has 4x24 workgroups and the
+                # extra partition combine is not repaid. Gate on the padded
+                # batch, which is a static per-graph value.
+                and attn_metadata.seq_lens.numel() <= 2
+                and splitkv_supports(
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_size,
+                    width,
+                    attn_metadata.max_seq_len,
+                    attn_metadata.causal,
+                    max(0, self.sliding_window[0]),
+                    self.sinks,
+                    query.dtype,
+                )
+            ):
+                # One workgroup covers a whole GQA group and the context is
+                # split across workgroups, so each K/V byte is read once and the
+                # combine is deterministic. Ragged query lengths (including
+                # mixed single-token graph rows) are masked per sequence, so the
+                # separate decode launch the prefix path needs is not required.
+                splitkv_verify_attention(
+                    query[:n],
+                    key_cache,
+                    value_cache,
+                    attn_metadata.block_table,
+                    attn_metadata.seq_lens,
+                    attn_metadata.query_start_loc,
+                    output[:n],
+                    max_query_len=width,
+                    max_seq_len=attn_metadata.max_seq_len,
+                    sm_scale=self.scale,
+                )
+                logger.info_once(
+                    "gfx1151 Qwen split-KV verification engaged: D=%d, M=%d",
+                    self.head_size,
+                    width,
+                )
+                return output
             if draft:
                 config = (16 if width <= 16 else 32, 64, 8)
             elif width in (4, 8, 16):
-                config = (16, 64, 4)
+                config = _verification_tile()
             elif width in (24, 32):
                 block_m = 16 if attn_metadata.seq_lens.numel() == 1 else 32
                 config = (block_m, 64, 4)

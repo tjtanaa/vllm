@@ -135,6 +135,12 @@ if TYPE_CHECKING:
     VLLM_GFX1151_QWEN_ATTENTION: bool = False
     VLLM_GFX1151_QWEN_GDN: bool = False
     VLLM_GFX1151_W4_GROUP_MAJOR: bool = False
+    VLLM_GFX1151_W4_LDS_TILE: bool = False
+    VLLM_GFX1151_W4_LOGITS: bool = False
+    VLLM_GFX1151_W4_LOGITS_TOPK: int = 256
+    VLLM_GFX1151_QWEN_VERIFY_TILE: str = "16,128,8"
+    VLLM_GFX1151_QWEN_MAX_CONTEXT: int = 4096
+    VLLM_GFX1151_QWEN_VERIFY_SPLITKV: bool = True
     VLLM_ROCM_USE_AITER_CUSTOM_AR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
@@ -1241,6 +1247,50 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Separate experimental GDN gate until numerical and serving validation.
     "VLLM_GFX1151_QWEN_GDN": lambda: (
         os.getenv("VLLM_GFX1151_QWEN_GDN", "0").lower() in ("true", "1")
+    ),
+    # Experimental gfx1151 W4A16 decode path that stages activations in LDS in
+    # K tiles, so token batches up to 8 stay weight-read bound. Restart to
+    # change dispatch.
+    "VLLM_GFX1151_W4_LDS_TILE": lambda: (
+        os.getenv("VLLM_GFX1151_W4_LDS_TILE", "0").lower() in ("true", "1")
+    ),
+    # Experimental gfx1151 derived int4 lm_head with exact top-K reranking for
+    # small token batches. Masks logits outside the top-K, so it is intended for
+    # greedy/low-temperature decoding. Restart to change.
+    "VLLM_GFX1151_W4_LOGITS": lambda: (
+        os.getenv("VLLM_GFX1151_W4_LOGITS", "0").lower() in ("true", "1")
+    ),
+    "VLLM_GFX1151_W4_LOGITS_TOPK": lambda: int(
+        os.getenv("VLLM_GFX1151_W4_LOGITS_TOPK", "256")
+    ),
+    # Longest context the gfx1151 Qwen tuned attention paths (split-KV
+    # verification, verification tile, prefix tile) are allowed to serve. The
+    # gate is `1024 <= max_seq_len <= this`, and CUDA-graph capture runs with
+    # max_seq_len set to the model maximum, so a value below --max-model-len
+    # silently disables every tuned path and falls back to the generic backend:
+    # measured at concurrency 1 with --max-model-len 32768 that costs
+    # 100.3 -> 140.5 ms ITL and 3.91 -> 2.57 accepted tokens per step.
+    #
+    # The default 4096 is the delivered value, tuned and tested at
+    # --max-model-len 4096, where it is a no-op because max_seq_len can never
+    # exceed max_model_len. Raise it to at least --max-model-len for longer
+    # contexts; recipes/gfx1151_qwen38_27b_w4a16.md records the validation
+    # (tuned paths re-engage, decode performance identical to the 4096 config,
+    # needle retrieval correct at 5,843 and 11,043 tokens). The scratch-pool
+    # reservation scales with min(max_model_len, this) / 256 partitions, so
+    # raising it costs memory only for runs that use the longer context.
+    "VLLM_GFX1151_QWEN_MAX_CONTEXT": lambda: int(
+        os.getenv("VLLM_GFX1151_QWEN_MAX_CONTEXT", "4096")
+    ),
+    # Verification-attention tile "BLOCK_M,BLOCK_N,warps" for the gfx1151 Qwen
+    # Triton prefix path; "legacy" restores the previously shipped 16,64,4.
+    "VLLM_GFX1151_QWEN_VERIFY_TILE": lambda: os.getenv(
+        "VLLM_GFX1151_QWEN_VERIFY_TILE", "16,128,8"
+    ),
+    # GQA-packed split-KV verification attention (measured ~3x faster than the
+    # per-query-head prefix tile on gfx1151). Set to 0 to fall back.
+    "VLLM_GFX1151_QWEN_VERIFY_SPLITKV": lambda: (
+        os.getenv("VLLM_GFX1151_QWEN_VERIFY_SPLITKV", "1").lower() in ("true", "1")
     ),
     # Experimental derived W4 cache (~11.68 GiB for Qwen 27B). Restart to change.
     "VLLM_GFX1151_W4_GROUP_MAJOR": lambda: (

@@ -199,6 +199,12 @@ def can_use(x, w_q, w_s, w_zp, bias, group_size, grouped_q, grouped_s):
         return False
     if m <= original.MAX_SKINNY_BATCH_SIZE and k * m <= original.LDS_CAPACITY_ELEMENTS:
         return False
+    if original.gfx1151_lds_tile_eligible(
+        x, w_q, w_s, w_zp, bias, group_size
+    ) is not None:
+        # The K-tiled LDS decode kernel covers this batch and reads the
+        # original ExLlama weights, so the derived cache is not needed here.
+        return False
     return (
         x.dtype == torch.bfloat16
         and x.device == w_q.device

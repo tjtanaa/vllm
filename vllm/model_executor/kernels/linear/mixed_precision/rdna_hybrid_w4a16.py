@@ -67,6 +67,105 @@ MAX_SKINNY_BATCH_SIZE = 5
 # (AMD RDNA has 128 KiB total LDS per CU, but 64 KiB per workgroup.)
 LDS_CAPACITY_ELEMENTS = 64 * 1024 // 2  # 32768 fp16 elements
 
+# Largest token batch handled by the gfx1151 K-tiled LDS decode kernel. Beyond
+# this the activation registers no longer fit comfortably next to the
+# accumulators and the measured winner is the group-major/Triton path.
+MAX_LDS_TILE_BATCH_SIZE = 8
+
+# (ytile, wvprgrp, unrl, kt) launch shapes instantiated in
+# csrc/rocm/skinny_gemms_int4.cu, selected per projection from measured gfx1151
+# timings (benchmarks/kernels/probe_gfx1151_w4a16_lds_tile.py). ``kt`` must keep
+# batch * kt fp16 elements inside the 64 KiB workgroup LDS budget.
+#
+# Only two batch ranges can reach this kernel: batches 2-4 for projections whose
+# activations overflow the whole-matrix LDS guard of wvSplitK_int4_g (down_proj
+# at K=17408), and batches 5-8 for every projection. Buckets are therefore 4 and
+# 8; anything else keeps the existing skinny or Triton path.
+_LdsTileConfig = tuple[int, int, int, int]
+_GFX1151_LDS_TILE_CONFIGS: dict[tuple[int, int], dict[int, _LdsTileConfig]] = (
+    {
+        # Qwen3.8-27B target projections.
+        (5120, 17408): {4: (4, 16, 2, 4096), 8: (8, 16, 1, 1024)},
+        (34816, 5120): {4: (4, 16, 2, 4096), 8: (8, 8, 1, 1024)},
+        (16384, 5120): {4: (4, 16, 2, 4096), 8: (4, 8, 1, 2048)},
+        (14336, 5120): {4: (4, 16, 2, 4096), 8: (8, 8, 1, 1024)},
+        (5120, 6144): {4: (2, 16, 2, 4096), 8: (4, 8, 2, 4096)},
+        # lm_head, used by the derived int4 logits head.
+        (248320, 5120): {4: (4, 16, 2, 4096), 8: (8, 8, 1, 2048)},
+        # DFlash2 draft projections (W4A16 draft checkpoints).
+        (6144, 5120): {4: (4, 16, 2, 4096), 8: (4, 8, 2, 4096)},
+        (5120, 4096): {4: (4, 16, 2, 4096), 8: (4, 8, 2, 4096)},
+    }
+)
+_GFX1151_LDS_TILE_DEFAULT: dict[int, tuple[int, int, int, int]] = {
+    4: (4, 16, 2, 4096),
+    8: (4, 8, 1, 2048),
+}
+_LDS_TILE_BATCH_BUCKETS = (4, 8)
+_LDS_TILE_OP_AVAILABLE: bool | None = None
+
+
+def _has_lds_tile_op() -> bool:
+    """Whether the installed ROCm extension exports the K-tiled LDS kernel."""
+    global _LDS_TILE_OP_AVAILABLE
+    if _LDS_TILE_OP_AVAILABLE is None:
+        _LDS_TILE_OP_AVAILABLE = hasattr(torch.ops, "_rocm_C") and hasattr(
+            torch.ops._rocm_C, "wvSplitK_int4_lds_tile_g"
+        )
+    return _LDS_TILE_OP_AVAILABLE
+
+
+def gfx1151_lds_tile_config(
+    out_features: int, k: int, batch: int
+) -> _LdsTileConfig | None:
+    """Launch shape for the K-tiled LDS decode kernel, or None if unsupported."""
+    if not (1 <= batch <= MAX_LDS_TILE_BATCH_SIZE):
+        return None
+    table = _GFX1151_LDS_TILE_CONFIGS.get((out_features, k))
+    for bucket in _LDS_TILE_BATCH_BUCKETS:
+        if batch <= bucket:
+            if table is not None and bucket in table:
+                return table[bucket]
+            return _GFX1151_LDS_TILE_DEFAULT[bucket]
+    return None
+
+
+def gfx1151_lds_tile_eligible(
+    x_2d: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s: torch.Tensor,
+    w_zp: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    group_size: int,
+) -> _LdsTileConfig | None:
+    """Contract check for the K-tiled LDS kernel; None means keep the fallback.
+
+    The kernel implements exactly the symmetric group-128 contraction the
+    skinny kernel implements, so zero points, bias, other group sizes and
+    non-gfx1151 devices stay on the existing paths.
+    """
+    if not envs.VLLM_GFX1151_W4_LDS_TILE or not _on_gfx1151():
+        return None
+    if not _has_lds_tile_op():
+        return None
+    if group_size != 128 or w_zp is not None or bias is not None:
+        return None
+    if x_2d.dtype not in (torch.float16, torch.bfloat16):
+        return None
+    if w_s.dtype != x_2d.dtype or w_q.dtype != torch.int8:
+        return None
+    if not (x_2d.is_contiguous() and w_q.is_contiguous() and w_s.is_contiguous()):
+        return None
+    batch, k = x_2d.shape[0], x_2d.shape[1]
+    if w_q.shape[1] * 2 != k or w_s.shape != (w_q.shape[0], k // 128):
+        return None
+    config = gfx1151_lds_tile_config(w_q.shape[0], k, batch)
+    if config is None:
+        return None
+    if batch * config[3] > LDS_CAPACITY_ELEMENTS:
+        return None
+    return config
+
 
 # ---------------------------------------------------------------------------
 # Triton kernel for the prefill path (reads skinny-format weights [N, K//8])
@@ -190,6 +289,23 @@ _GFX1X_PREFILL_OVERRIDES: dict[tuple[int, int, int], tuple[int, int, int, int, i
 }
 
 
+# Per-shape (group_size, K, N) -> (BLOCK_M, BLOCK_N, BLOCK_K, num_warps,
+# num_stages) overrides for gfx1151 prefill-sized batches (128 < M <= 2048).
+# Measured at M=1024 on Qwen3.8-27B W4A16 with
+# benchmarks/kernels/sweep_gfx1151_w4a16_prefill.py: 2.59 s instead of 2.93 s of
+# GEMM time per 1024-token prefill pass (-11.5%), 18.4-20.2 TFLOPS versus this
+# machine's 26 TFLOPS rocBLAS BF16 peak. Each entry beat the generic heuristic
+# for its shape; re-run the sweep after edits.
+_TileConfig = tuple[int, int, int, int, int]
+_GFX1151_LARGE_M_OVERRIDES: dict[tuple[int, int, int], _TileConfig] = {
+    (128, 17408, 5120): (128, 128, 64, 8, 1),  # down_proj
+    (128, 5120, 34816): (128, 64, 64, 4, 1),  # gate_up_proj
+    (128, 5120, 16384): (64, 128, 64, 4, 1),  # GDN in_proj_qkvz
+    (128, 5120, 14336): (128, 64, 64, 4, 1),  # full-attention qkv_proj
+    (128, 6144, 5120): (128, 64, 64, 4, 1),  # o_proj / GDN out_proj
+}
+
+
 def triton_w4a16_skinny_fmt_gemm(
     a: torch.Tensor,  # [M, K] fp16/bf16
     b_q: torch.Tensor,  # [N, K//8] int32 (ExLlama shuffle packed)
@@ -279,9 +395,10 @@ def triton_w4a16_skinny_fmt_gemm(
         # Per-shape overrides for known prefill regressions live in a small
         # lookup table — see _GFX1X_PREFILL_OVERRIDES below. Re-run
         # benchmarks/kernels/benchmark_rdna_hybrid_w4a16_gemm.py after edits.
-        override = (
-            _GFX1X_PREFILL_OVERRIDES.get((group_size, K, N)) if M <= 128 else None
-        )
+        if M <= 128:
+            override = _GFX1X_PREFILL_OVERRIDES.get((group_size, K, N))
+        else:
+            override = _GFX1151_LARGE_M_OVERRIDES.get((group_size, K, N))
         if override is not None:
             BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages = override
         elif M <= 32:
@@ -406,6 +523,16 @@ def _rdna_hybrid_w4a16_apply_impl(
         )
         with ctx:
             return ops.wvSplitK_int4_g(w_q, x_2d, w_s, cu_count, group_size, w_zp, bias)
+
+    lds_tile = gfx1151_lds_tile_eligible(x_2d, w_q, w_s, w_zp, bias, group_size)
+    if lds_tile is not None:
+        ctx = (
+            nullcontext()
+            if torch.compiler.is_compiling()
+            else torch.profiler.record_function(f"w4a16_lds_tile {M}x{N}x{K}")
+        )
+        with ctx:
+            return ops.wvSplitK_int4_lds_tile_g(w_q, x_2d, w_s, *lds_tile)
 
     ctx = (
         nullcontext()

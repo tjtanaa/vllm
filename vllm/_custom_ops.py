@@ -2412,6 +2412,47 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "wvSplitK_int4_g
         )
 
 
+def wvSplitK_int4_lds_tile_g(
+    weight: torch.Tensor,
+    activation: torch.Tensor,
+    scale: torch.Tensor,
+    ytile: int,
+    wvprgrp: int,
+    unrl: int,
+    kt: int,
+) -> torch.Tensor:
+    """W4A16 skinny GEMM with K-tiled LDS activation staging.
+
+    Same operands as :func:`wvSplitK_int4_g` (weight-major packed int4, group
+    size 128, symmetric, no bias) but the activation matrix is staged in LDS in
+    K tiles, so token batches whose activations exceed LDS stay on the
+    weight-read-bound fast path instead of re-reading them from L2 per row tile.
+    Returns ``[num_tokens, out_features]``.
+    """
+    return torch.ops._rocm_C.wvSplitK_int4_lds_tile_g(
+        weight, activation, scale, ytile, wvprgrp, unrl, kt
+    )
+
+
+if hasattr(torch.ops, "_rocm_C") and hasattr(
+    torch.ops._rocm_C, "wvSplitK_int4_lds_tile_g"
+):
+
+    @register_fake("_rocm_C::wvSplitK_int4_lds_tile_g")
+    def _wvSplitK_int4_lds_tile_g_fake(
+        in_a: torch.Tensor,
+        in_b: torch.Tensor,
+        in_scale: torch.Tensor,
+        ytile: int,
+        wvprgrp: int,
+        unrl: int,
+        kt: int,
+    ) -> torch.Tensor:
+        return torch.empty(
+            (in_b.size(0), in_a.size(0)), dtype=in_b.dtype, device=in_b.device
+        )
+
+
 def wvSplitKrc(
     a: torch.Tensor, b: torch.Tensor, cu_count: int, bias: torch.Tensor = None
 ) -> torch.Tensor:

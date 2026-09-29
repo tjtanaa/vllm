@@ -9,8 +9,12 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
+from vllm.v1.attention.backends.gfx1151_qwen_attn import _verification_tile
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.selector import AttentionSelectorConfig
+
+# Measured verification tile for width 4/8/16 (see _verification_tile docstring).
+QWEN_VERIFY_TILE = _verification_tile()
 
 # ROCm-specific attention backend selection tests
 pytestmark = pytest.mark.skipif(
@@ -550,13 +554,13 @@ def test_gfx1151_forward_dispatch_preserves_fallback(gfx1151_config, monkeypatch
         ("table_dtype", 1, 24, None),
         ("empty", 1, 24, None),
         ("cascade", 1, 24, None),
-        ("missing_key", 2, 8, (16, 64, 4)),
-        ("missing_value", 2, 8, (16, 64, 4)),
+        ("missing_key", 2, 8, QWEN_VERIFY_TILE),
+        ("missing_value", 2, 8, QWEN_VERIFY_TILE),
         ("noncausal", 2, 8, None),
         ("sliding", 2, 8, None),
         ("sinks", 2, 8, None),
     ]
-    + [("supported", b, q, (16, 64, 4)) for b in (1, 2, 4, 8) for q in (4, 8, 16)]
+    + [("supported", b, q, QWEN_VERIFY_TILE) for b in (1, 2, 4, 8) for q in (4, 8, 16)]
     + [("supported", b, 32, (16 if b == 1 else 32, 64, 4)) for b in (1, 2, 4, 8)]
     + [("missing_key", 1, 32, (16, 64, 4)), ("missing_value", 2, 32, (32, 64, 4))]
     + [
@@ -663,8 +667,10 @@ def test_gfx1151_prefix_dispatch_contract(
         metadata.use_cascade = True
     layer = SimpleNamespace(_k_scale=torch.ones(()), _v_scale=torch.ones(()))
     launch, hip, workspace = MagicMock(), MagicMock(), MagicMock()
+    splitkv = MagicMock()
     monkeypatch.setattr(backend, "gfx1151_qwen_prefill", launch)
     monkeypatch.setattr(backend.ops, "gfx1151_qwen_paged_attention", hip)
+    monkeypatch.setattr(backend, "splitkv_verify_attention", splitkv)
     monkeypatch.setattr(backend, "is_workspace_manager_initialized", lambda: False)
     monkeypatch.setattr(backend, "current_workspace_manager", workspace)
     with (
@@ -681,12 +687,50 @@ def test_gfx1151_prefix_dispatch_contract(
     assert result is output
     hip.assert_not_called()
     workspace.assert_not_called()
-    if expected is None:
+    # Mirror the backend's split-KV gate: the GQA-packed kernel is tried before
+    # the prefix tile and returns early, so those cases never reach `launch`.
+    splitkv_expected = (
+        expected is not None
+        and not draft
+        and qlen in (4, 8, 16, 32)
+        and batch <= 2
+        and backend.envs.VLLM_GFX1151_QWEN_VERIFY_SPLITKV
+        and backend.splitkv_supports(
+            heads,
+            kv_heads,
+            dim,
+            qlen,
+            metadata.max_seq_len,
+            metadata.causal,
+            max(0, impl.sliding_window[0]),
+            impl.sinks,
+            query.dtype,
+        )
+    )
+    if splitkv_expected:
+        fallback.assert_not_called()
+        launch.assert_not_called()
+        splitkv.assert_called_once()
+        assert splitkv.call_args.kwargs == dict(
+            max_query_len=qlen,
+            max_seq_len=metadata.max_seq_len,
+            sm_scale=impl.scale,
+        )
+        args = splitkv.call_args.args
+        assert args[0].data_ptr() == query.data_ptr()
+        assert args[0].shape == (tokens, heads, dim)
+        assert args[3] is metadata.block_table
+        assert args[4] is metadata.seq_lens
+        assert args[5] is metadata.query_start_loc
+        assert args[6].data_ptr() == output.data_ptr()
+    elif expected is None:
         fallback.assert_called_once()
         launch.assert_not_called()
+        splitkv.assert_not_called()
     else:
         fallback.assert_not_called()
         launch.assert_called_once()
+        splitkv.assert_not_called()
         args = launch.call_args.args
         assert args[-1] == expected
         assert args[0].data_ptr() == query.data_ptr()
@@ -702,6 +746,48 @@ def test_gfx1151_prefix_dispatch_contract(
         assert args[13] == impl.scale
         assert launch.call_args.kwargs == dict(
             causal=not draft, window=2047 if draft else 0
+        )
+
+
+@pytest.mark.parametrize("override", [None, 4096, 32768])
+@pytest.mark.parametrize("max_model_len", [4096, 8192])
+def test_gfx1151_max_context_cap_and_scratch(
+    gfx1151_config, monkeypatch, max_model_len, override
+):
+    """The context cap gates the tuned paths and sizes the reserved scratch.
+
+    CUDA-graph capture runs with max_seq_len = max_model_len, so a cap below
+    --max-model-len silently disables every tuned gfx1151 attention path.
+    VLLM_GFX1151_QWEN_MAX_CONTEXT raises it; it must never lower the delivered
+    4096, and the reservation must scale with min(max_model_len, cap) so that
+    raising the cap is a no-op for a 4096-context run - the configuration every
+    published gfx1151 number was measured with.
+    """
+    from vllm.v1.attention.backends import gfx1151_qwen_attn as backend
+
+    if override is None:
+        monkeypatch.delenv("VLLM_GFX1151_QWEN_MAX_CONTEXT", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_GFX1151_QWEN_MAX_CONTEXT", str(override))
+    gfx1151_config.model_config.max_model_len = max_model_len
+    gfx1151_config.scheduler_config.max_num_seqs = 8
+    impl = backend.Gfx1151QwenAttentionImpl(24, 256, 256**-0.5, 4, None, None, "auto")
+
+    cap = max(backend.MAX_CONTEXT, override or 0)
+    assert impl._max_context == cap
+    partitions = (
+        min(max_model_len, cap) + backend.PARTITION_SIZE - 1
+    ) // backend.PARTITION_SIZE
+    assert impl._workspace_shape[2] == partitions
+    assert impl._workspace_shape[0] == min(8, backend.MAX_BATCH) * backend.MAX_QUERY
+    if max_model_len <= backend.MAX_CONTEXT:
+        # Unchanged by the override: the measured configuration stays identical.
+        assert partitions == max_model_len // backend.PARTITION_SIZE
+    else:
+        assert partitions == (
+            (max_model_len + backend.PARTITION_SIZE - 1) // backend.PARTITION_SIZE
+            if override and override >= max_model_len
+            else backend.MAX_CONTEXT // backend.PARTITION_SIZE
         )
 
 
@@ -754,8 +840,10 @@ def test_gfx1151_capture_dispatch_and_locked_workspace(
     pointer = reserved.data_ptr()
     launch = MagicMock()
     prefix_launch = MagicMock()
+    splitkv_launch = MagicMock()
     monkeypatch.setattr(backend.ops, "gfx1151_qwen_paged_attention", launch)
     monkeypatch.setattr(backend, "gfx1151_qwen_prefill", prefix_launch)
+    monkeypatch.setattr(backend, "splitkv_verify_attention", splitkv_launch)
     builder = object.__new__(backend.Gfx1151QwenAttentionMetadataBuilder)
     builder.device = torch.device("cpu")
 
@@ -798,6 +886,7 @@ def test_gfx1151_capture_dispatch_and_locked_workspace(
         )
         launch.reset_mock()
         prefix_launch.reset_mock()
+        splitkv_launch.reset_mock()
         with (
             patch.object(
                 torch.Tensor, "is_cuda", new_callable=PropertyMock, return_value=True
@@ -807,21 +896,57 @@ def test_gfx1151_capture_dispatch_and_locked_workspace(
             ) as fallback,
         ):
             impl.forward(layer, query, key, value, cache, metadata, output)
-        if length > backend.MAX_CONTEXT:
+        # Mirror the backend's split-KV gate so the expected dispatch is derived
+        # from the same conditions rather than restated as a literal.
+        splitkv_expected = (
+            not draft
+            and width in (4, 8, 16, 32)
+            and batch <= 2
+            and backend.envs.VLLM_GFX1151_QWEN_VERIFY_SPLITKV
+            and backend.splitkv_supports(
+                heads,
+                kv_heads,
+                dim,
+                width,
+                length,
+                not draft,
+                max(0, impl.sliding_window[0]),
+                impl.sinks,
+                query.dtype,
+            )
+        )
+        if length > impl._max_context:
             fallback.assert_called_once()
             launch.assert_not_called()
             prefix_launch.assert_not_called()
+            splitkv_launch.assert_not_called()
+        elif splitkv_expected:
+            # GQA-packed split-KV verification is tried before the prefix tile
+            # and returns early, so neither other launcher may fire.
+            fallback.assert_not_called()
+            launch.assert_not_called()
+            prefix_launch.assert_not_called()
+            splitkv_launch.assert_called_once()
+            assert splitkv_launch.call_args.kwargs == dict(
+                max_query_len=width, max_seq_len=length, sm_scale=impl.scale
+            )
+            args = splitkv_launch.call_args.args
+            assert args[0].shape == (tokens, heads, dim)
+            assert args[6].shape == (tokens, heads, dim)
+            assert args[4].shape == (batch,)
         elif draft or width in (4, 8, 16, 24, 32):
             fallback.assert_not_called()
             launch.assert_not_called()
+            splitkv_launch.assert_not_called()
             prefix_launch.assert_called_once()
             args = prefix_launch.call_args.args
             assert args[9:11] == (length, width)
-            expected = (
-                (16 if width <= 16 else 32, 64, 8)
-                if draft
-                else (16 if width <= 16 or batch == 1 else 32, 64, 4)
-            )
+            if draft:
+                expected = (16 if width <= 16 else 32, 64, 8)
+            elif width <= 16:
+                expected = QWEN_VERIFY_TILE
+            else:
+                expected = (16 if batch == 1 else 32, 64, 4)
             assert args[-1] == expected
             assert prefix_launch.call_args.kwargs == dict(
                 causal=not draft, window=2047 if draft else 0
@@ -832,6 +957,7 @@ def test_gfx1151_capture_dispatch_and_locked_workspace(
             fallback.assert_not_called()
             launch.assert_called_once()
             prefix_launch.assert_not_called()
+            splitkv_launch.assert_not_called()
             workspace = launch.call_args.args[8]
             assert workspace.data_ptr() == pointer
             assert workspace.is_contiguous()

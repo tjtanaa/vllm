@@ -79,6 +79,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "int group_size) -> Tensor");
   rocm_ops.impl("wvSplitK_int4_g", torch::kCUDA, &wvSplitK_int4_g);
 
+  // W4A16 skinny GEMM with K-tiled LDS activation staging: same packed int4
+  // operands and group-128 scales as wvSplitK_int4_g, but supports token
+  // batches whose activations do not fit in LDS at once. The launch shape
+  // (ytile, wvprgrp, unrl, kt) is chosen by the Python dispatcher.
+  rocm_ops.def(
+      "wvSplitK_int4_lds_tile_g(Tensor in_a, Tensor in_b, Tensor in_scale, "
+      "int ytile, int wvprgrp, int unrl, int kt) -> Tensor");
+  rocm_ops.impl("wvSplitK_int4_lds_tile_g", torch::kCUDA,
+                &wvSplitK_int4_lds_tile_g);
+
   // Custom gemm op for skinny matrix-matrix multiplication
   rocm_ops.def(
       "wvSplitKrc(Tensor in_a, Tensor in_b, Tensor? in_bias, int CuCount) -> "
