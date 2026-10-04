@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import io
+import os
 from collections.abc import Iterable
 
 import torch
@@ -50,6 +51,10 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+# Debug: verify draft context-KV writes land and survive until decode.
+# Enabled with VLLM_DFLASH_KV_DBG=1. Forces syncs; never enable in prod.
+_KV_DBG = bool(int(os.environ.get("VLLM_DFLASH_KV_DBG", "0")))
 
 
 _SLIDING_ATTENTION = "sliding_attention"
@@ -640,6 +645,18 @@ class DFlashQwen3Model(nn.Module):
         hd = self._head_dim
         nkv = self._num_kv_heads
 
+        if _KV_DBG and num_ctx > 0:
+            cs = context_states.float()
+            logger.info(
+                "DFKV pre: n=%d pos=[%d..%d] hs_absmean=%.5f hs0=%s hsN=%s",
+                num_ctx,
+                int(context_positions[0].item()),
+                int(context_positions[num_ctx - 1].item()),
+                cs.abs().mean().item(),
+                [round(x, 4) for x in cs[0, :3].tolist()],
+                [round(x, 4) for x in cs[-1, :3].tolist()],
+            )
+
         all_k, all_v = self._project_context_kv(context_states, num_ctx, L, nkv, hd)
         all_k_normed = self._normalize_context_k(all_k)
 
@@ -681,6 +698,94 @@ class DFlashQwen3Model(nn.Module):
                 kv_cache,
                 slot_mapping,
             )
+
+        if _KV_DBG:
+            self._dbg_verify_writes(
+                context_positions,
+                context_slot_mapping,
+                all_k_final,
+                all_v,
+                num_ctx,
+                nkv,
+                hd,
+            )
+
+    def _dbg_verify_writes(self, context_positions, context_slot_mapping, all_k_final, all_v, num_ctx, nkv, hd):
+        """Read back written K vectors immediately and again at first decode."""
+        from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+        from vllm.v1.attention.ops.paged_attn import PagedAttention
+
+        sm0 = (
+            context_slot_mapping[0]
+            if isinstance(context_slot_mapping, (list, tuple))
+            else context_slot_mapping
+        )
+        attn0 = self._attn_layers[0]
+        kc0, vc0 = PagedAttention.split_kv_cache(
+            attn0.kv_cache.transpose(0, 1), nkv, hd
+        )
+        # key_cache: [blocks, heads, hd//x, block_size, x]; x=8 for bf16.
+        # value_cache: [blocks, heads, head_size, block_size].
+        bs_phys = kc0.shape[3]
+        valid = (sm0[:num_ctx] != PAD_SLOT_ID).nonzero(as_tuple=True)[0]
+        if valid.numel() == 0:
+            return
+        rows = (
+            valid[:2].tolist() + valid[-2:].tolist()
+            if valid.numel() >= 4
+            else valid.tolist()
+        )
+        if num_ctx > 1024:
+            step = max(1, valid.numel() // 8)
+            rows = sorted(set(rows + valid[::step].tolist()))
+
+        def _read(slot):
+            b, s = slot // bs_phys, slot % bs_phys
+            k = kc0[b, 0, 0, s, :8].float()
+            v = vc0[b, 0, :8, s].float()
+            return k, v
+
+        if num_ctx > 64:
+            for row in rows:
+                slot = int(sm0[row].item())
+                exp = all_k_final[0, row, 0, :8].float()
+                exp_v = all_v[0, row, 0, :8].float()
+                got, got_v = _read(slot)
+                logger.info(
+                    "DFKV write-verify: pos=%d slot=%d blk=%d off=%d kdiff=%.6f "
+                    "vdiff=%.6f exp0=%.4f got0=%.4f expv0=%.4f gotv0=%.4f",
+                    int(context_positions[row].item()),
+                    slot,
+                    slot // bs_phys,
+                    slot % bs_phys,
+                    (got - exp).abs().max().item(),
+                    (got_v - exp_v).abs().max().item(),
+                    exp[0].item(),
+                    got[0].item(),
+                    exp_v[0].item(),
+                    got_v[0].item(),
+                )
+                self._dbg_pending = getattr(self, "_dbg_pending", []) + [
+                    (int(context_positions[row].item()), slot, exp.clone(), exp_v.clone())
+                ]
+        elif getattr(self, "_dbg_pending", None):
+            for pos, slot, exp, exp_v in self._dbg_pending:
+                got, got_v = _read(slot)
+                logger.info(
+                    "DFKV decode-verify: pos=%d slot=%d blk=%d off=%d kdiff=%.6f "
+                    "vdiff=%.6f exp0=%.4f got0=%.4f expv0=%.4f gotv0=%.4f",
+                    pos,
+                    slot,
+                    slot // bs_phys,
+                    slot % bs_phys,
+                    (got - exp).abs().max().item(),
+                    (got_v - exp_v).abs().max().item(),
+                    exp[0].item(),
+                    got[0].item(),
+                    exp_v[0].item(),
+                    got_v[0].item(),
+                )
+            self._dbg_pending = []
 
     def forward(
         self,

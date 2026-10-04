@@ -289,21 +289,50 @@ _GFX1X_PREFILL_OVERRIDES: dict[tuple[int, int, int], tuple[int, int, int, int, i
 }
 
 
-# Per-shape (group_size, K, N) -> (BLOCK_M, BLOCK_N, BLOCK_K, num_warps,
-# num_stages) overrides for gfx1151 prefill-sized batches (128 < M <= 2048).
-# Measured at M=1024 on Qwen3.8-27B W4A16 with
+# Per-shape (group_size, K, N) -> M-binned (BLOCK_M, BLOCK_N, BLOCK_K,
+# num_warps, num_stages) overrides for gfx1151 prefill-sized batches (M > 128).
+# Each shape maps to an ordered tuple of (max_M_inclusive, config) bins; the
+# first bin with M <= threshold wins, the last bin is the open-ended fallback.
+#
+# Bin <=1024: measured at M=1024 on Qwen3.8-27B W4A16 with
 # benchmarks/kernels/sweep_gfx1151_w4a16_prefill.py: 2.59 s instead of 2.93 s of
 # GEMM time per 1024-token prefill pass (-11.5%), 18.4-20.2 TFLOPS versus this
-# machine's 26 TFLOPS rocBLAS BF16 peak. Each entry beat the generic heuristic
-# for its shape; re-run the sweep after edits.
+# machine's 26 TFLOPS rocBLAS BF16 peak.
+#
+# Bin >1024 (2026-10-03): production chunked prefill runs M=3328-4160
+# (832-aligned chunks), where the M=1024 configs lose 1.3-1.55x per GEMM
+# (swept at M=2250/3328/4160 in the same thermal windows; prod-vs-grid
+# absolute times drift with sustained-load throttling, per-M ratios do not).
+# Aggregate per-chunk GEMM time at M=4160: ~21.5 s -> ~15.4 s (-28%).
+# Re-run the sweep at production chunk sizes after edits.
 _TileConfig = tuple[int, int, int, int, int]
-_GFX1151_LARGE_M_OVERRIDES: dict[tuple[int, int, int], _TileConfig] = {
-    (128, 17408, 5120): (128, 128, 64, 8, 1),  # down_proj
-    (128, 5120, 34816): (128, 64, 64, 4, 1),  # gate_up_proj
-    (128, 5120, 16384): (64, 128, 64, 4, 1),  # GDN in_proj_qkvz
-    (128, 5120, 14336): (128, 64, 64, 4, 1),  # full-attention qkv_proj
-    (128, 6144, 5120): (128, 64, 64, 4, 1),  # o_proj / GDN out_proj
+_M_OPEN = 1 << 62
+_GFX1151_LARGE_M_OVERRIDES: dict[
+    tuple[int, int, int], tuple[tuple[int, _TileConfig], ...]
+] = {
+    # down_proj: (64,128,128) wins from 2250 up; st=2 only +2% at 4160, not binned.
+    (128, 17408, 5120): ((1024, (128, 128, 64, 8, 1)), (_M_OPEN, (64, 128, 128, 8, 1))),
+    # gate_up_proj: biggest mismatch — (128,64,64,4) falls to 8.9 TF at M=4160.
+    (128, 5120, 34816): ((1024, (128, 64, 64, 4, 1)), (_M_OPEN, (128, 128, 64, 8, 1))),
+    # GDN in_proj_qkvz
+    (128, 5120, 16384): ((1024, (64, 128, 64, 4, 1)), (_M_OPEN, (128, 128, 64, 8, 1))),
+    # full-attention qkv_proj
+    (128, 5120, 14336): ((1024, (128, 64, 64, 4, 1)), (_M_OPEN, (128, 128, 64, 8, 1))),
+    # o_proj / GDN out_proj
+    (128, 6144, 5120): ((1024, (128, 64, 64, 4, 1)), (_M_OPEN, (64, 128, 128, 8, 1))),
 }
+
+
+def _gfx1151_large_m_override(
+    group_size: int, K: int, N: int, M: int
+) -> _TileConfig | None:
+    bins = _GFX1151_LARGE_M_OVERRIDES.get((group_size, K, N))
+    if bins is None:
+        return None
+    for threshold, cfg in bins:
+        if M <= threshold:
+            return cfg
+    return bins[-1][1]
 
 
 def triton_w4a16_skinny_fmt_gemm(
@@ -398,7 +427,7 @@ def triton_w4a16_skinny_fmt_gemm(
         if M <= 128:
             override = _GFX1X_PREFILL_OVERRIDES.get((group_size, K, N))
         else:
-            override = _GFX1151_LARGE_M_OVERRIDES.get((group_size, K, N))
+            override = _gfx1151_large_m_override(group_size, K, N, M)
         if override is not None:
             BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages = override
         elif M <= 32:
@@ -490,6 +519,106 @@ def pack_int4_exllama_shuffle(w_uint4: torch.Tensor) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# Streaming dequant -> rocBLAS bf16 path for prefill-sized M (gfx1151)
+# ---------------------------------------------------------------------------
+# The fused Triton W4A16 kernels dequantize inside the GEMM inner loop and
+# top out at ~15.5-16.1 TFLOPS on this part. rocBLAS bf16 measures 19.9-26.4
+# TFLOPS on the production shapes at M=3328-7488. For prefill-sized batches it
+# is cheaper to stream the layer's int4 weights through a reusable bf16
+# workspace (~1-2 ms per projection at 242 GB/s) and let rocBLAS run the GEMM:
+# net -29% GEMM time per 7488-token chunk (measured 2026-10-03). Below
+# _DEQUANT_MM_MIN_M the extra 3x weight traffic loses to the fused int4 read.
+#
+# Dequantization is bit-exact with the fused kernels' inner dequant:
+# bf16(code - 8) * bf16(scale), same ExLlama nibble shifts. Only GEMM
+# accumulation order differs (same class as a tile-config change).
+
+_DEQUANT_WORKSPACES: dict[tuple[int, int], torch.Tensor] = {}
+_DEQUANT_MM_MIN_M = 2048
+_DEQUANT_MM_MAX_WEIGHT_BYTES = 512 * 1024 * 1024
+
+
+@triton.jit
+def _w4a16_dequant_skinny_kernel(
+    q_ptr,  # [N, K//8] int32, ExLlama-shuffled nibbles
+    s_ptr,  # [N, K//GROUP] bf16 scales, row-major
+    out_ptr,  # [N, K] bf16
+    N,
+    K,
+    NUM_GROUPS,
+    BLOCK_N: tl.constexpr,
+    GROUP: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_g = tl.program_id(1)
+    rows = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rmask = rows < N
+    WORDS: tl.constexpr = GROUP // 8
+    j = tl.arange(0, WORDS)
+    s = tl.arange(0, 8)
+    shifts = (s // 2) * 4 + (s % 2) * 16  # ExLlama unshuffle shifts
+    q = tl.load(
+        q_ptr + rows[:, None] * (K // 8) + pid_g * WORDS + j[None, :],
+        mask=rmask[:, None],
+        other=0,
+    )  # [BLOCK_N, WORDS] int32
+    codes = (q[:, :, None] >> shifts[None, None, :]) & 0xF  # [BN, WORDS, 8]
+    sc = tl.load(s_ptr + rows * NUM_GROUPS + pid_g, mask=rmask, other=0.0)
+    w = (codes - 8).to(tl.bfloat16) * sc[:, None, None]
+    w = tl.reshape(w, (BLOCK_N, GROUP))
+    cols = pid_g * GROUP + tl.arange(0, GROUP)
+    tl.store(out_ptr + rows[:, None] * K + cols[None, :], w, mask=rmask[:, None])
+
+
+def dequant_mm_w4a16(
+    x_2d: torch.Tensor,
+    w_q_i32: torch.Tensor,
+    w_s: torch.Tensor,
+    group_size: int,
+) -> torch.Tensor:
+    """Stream-dequantize weights to a cached bf16 workspace, then rocBLAS mm."""
+    M, K = x_2d.shape
+    N = w_q_i32.shape[0]
+    key = (N, K)
+    buf = _DEQUANT_WORKSPACES.get(key)
+    if buf is None:
+        buf = torch.empty((N, K), dtype=torch.bfloat16, device=x_2d.device)
+        _DEQUANT_WORKSPACES[key] = buf
+    BLOCK_N = 64
+    _w4a16_dequant_skinny_kernel[(triton.cdiv(N, BLOCK_N), K // group_size)](
+        w_q_i32,
+        w_s,
+        buf,
+        N,
+        K,
+        K // group_size,
+        BLOCK_N=BLOCK_N,
+        GROUP=group_size,
+        num_warps=4,
+    )
+    return torch.mm(x_2d, buf.t())
+
+
+def _dequant_mm_eligible(x_2d, w_q, w_s, w_zp, group_size) -> bool:
+    M, K = x_2d.shape
+    N = w_q.shape[0]
+    return (
+        envs.VLLM_GFX1151_W4_DEQUANT_MM
+        and _on_gfx1151()
+        and M >= _DEQUANT_MM_MIN_M
+        and w_zp is None
+        and group_size == 128
+        and x_2d.dtype == torch.bfloat16
+        and w_s.dtype == torch.bfloat16
+        and w_q.dtype == torch.int8
+        and w_q.is_contiguous()
+        and w_s.is_contiguous()
+        and K % 128 == 0
+        and N * K * 2 <= _DEQUANT_MM_MAX_WEIGHT_BYTES
+    )
+
+
+# ---------------------------------------------------------------------------
 # Hybrid dispatch logic
 # ---------------------------------------------------------------------------
 
@@ -533,6 +662,18 @@ def _rdna_hybrid_w4a16_apply_impl(
         )
         with ctx:
             return ops.wvSplitK_int4_lds_tile_g(w_q, x_2d, w_s, *lds_tile)
+
+    if _dequant_mm_eligible(x_2d, w_q, w_s, w_zp, group_size):
+        ctx = (
+            nullcontext()
+            if torch.compiler.is_compiling()
+            else torch.profiler.record_function(f"w4a16_dequant_mm {M}x{N}x{K}")
+        )
+        with ctx:
+            output = dequant_mm_w4a16(x_2d, w_q.view(torch.int32), w_s, group_size)
+            if bias is not None:
+                output = output + bias
+        return output
 
     ctx = (
         nullcontext()

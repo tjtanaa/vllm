@@ -5,6 +5,8 @@
 from dataclasses import dataclass
 from typing import ClassVar
 
+import os
+
 import torch
 
 from vllm import _custom_ops as ops
@@ -33,6 +35,8 @@ from vllm.v1.worker.workspace import (
 )
 
 logger = init_logger(__name__)
+
+_ATTN_DBG = bool(int(os.environ.get("VLLM_DFLASH_DEBUG", "0")))
 # Delivered longest context for the tuned paths; VLLM_GFX1151_QWEN_MAX_CONTEXT
 # raises it per process. See the comment in vllm/envs.py: a value below
 # --max-model-len silently disables every tuned gfx1151 attention path, because
@@ -399,6 +403,29 @@ class Gfx1151QwenAttentionImpl(RocmAttentionImpl):
             output_block_scale,
         )
         if not (use_hip or use_triton):
+            if _ATTN_DBG and self.head_size == 128 and attn_metadata is not None:
+                self._dbg_calls = getattr(self, "_dbg_calls", 0) + 1
+                if self._dbg_calls <= 40 or self._dbg_calls % 500 == 0:
+                    logger.info(
+                        "ATTN_DBG call=%d hip=%s triton=%s FALLBACK max_seq=%d "
+                        "npart=%d nat=%d seq0=%s qsl=%s bt=%s cascade=%s "
+                        "win=%s causal=%s maxctx=%d enabled=%s ws_init=%s",
+                        self._dbg_calls,
+                        use_hip,
+                        use_triton,
+                        attn_metadata.max_seq_len,
+                        attn_metadata.num_partitions,
+                        attn_metadata.num_actual_tokens,
+                        attn_metadata.seq_lens[:2].tolist(),
+                        attn_metadata.query_start_loc[:3].tolist(),
+                        tuple(attn_metadata.block_table.shape),
+                        attn_metadata.use_cascade,
+                        self.sliding_window,
+                        attn_metadata.causal,
+                        self._max_context,
+                        self._enabled,
+                        is_workspace_manager_initialized(),
+                    )
             return super().forward(
                 layer,
                 query,
@@ -471,9 +498,14 @@ class Gfx1151QwenAttentionImpl(RocmAttentionImpl):
                 block_m = 16 if attn_metadata.seq_lens.numel() == 1 else 32
                 config = (block_m, 64, 4)
             else:
-                # This choice wins for full prompts and remains repeatably
-                # faster for cached-prefix chunks, without a host tensor read.
-                config = (64, 64, 8)
+                # Re-swept 2026-10-03 (benchmarks/kernels/
+                # sweep_gfx1151_attn_prefill_configs.py): BLOCK_M=128 wins
+                # across the whole gated range at D=256 — 1.36x at M=1024,
+                # 1.62-1.64x at M=2048-3328, 1.81x with deep cached context
+                # (M=3328/ctx=48k and M=7488/ctx=96k), ~11.6-12.0 TFLOPS vs
+                # 6.4-7.3 for (64,64,8). The old (64,64,8) predates the
+                # split-KV/prefix rework.
+                config = (128, 64, 8)
             gfx1151_qwen_prefill(
                 query[:n],
                 None if cached_verification else key[:n],
@@ -499,6 +531,32 @@ class Gfx1151QwenAttentionImpl(RocmAttentionImpl):
                 attn_metadata.max_query_len,
                 config,
             )
+            if (
+                _ATTN_DBG
+                and self.head_size == 128
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                self._dbg_out_calls = getattr(self, "_dbg_out_calls", 0) + 1
+                _seq0 = int(attn_metadata.seq_lens[0].item()) if attn_metadata.seq_lens.numel() else 0
+                if _seq0 >= 1024:
+                    self._dbg_real = getattr(self, "_dbg_real", 0) + 1
+                    if self._dbg_real <= 6 or self._dbg_real % 100 == 0:
+                        o = output[:n].float()
+                        qq = query[:n].float()
+                        logger.info(
+                            "ATTN_DBG out real=%d seq0=%d q_absmean=%.4f q_row0=%s "
+                            "out_absmean=%.4f nan=%d inf=%d zero_rows=%d/%d out_row0=%s",
+                            self._dbg_real,
+                            _seq0,
+                            qq.abs().mean().item(),
+                            [round(x, 3) for x in qq[0, 0, :3].tolist()],
+                            o.abs().mean().item(),
+                            int(torch.isnan(o).sum().item()),
+                            int(torch.isinf(o).sum().item()),
+                            int((o.abs().amax(dim=(1, 2)) == 0).sum().item()),
+                            n,
+                            [round(x, 3) for x in o[0, 0, :3].tolist()],
+                        )
             return output
         (workspace,) = current_workspace_manager().get_simultaneous(
             (

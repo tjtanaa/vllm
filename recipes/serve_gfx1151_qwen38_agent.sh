@@ -37,6 +37,21 @@ MAX_BATCHED_TOKENS=${MAX_BATCHED_TOKENS:-4096}
 # pattern of resending a system prompt and tool schema every turn.
 ENABLE_PREFIX_CACHING=${ENABLE_PREFIX_CACHING:-1}
 GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.85}
+# Tool calling: without these vLLM rejects any request carrying `tools` with
+# HTTP 400 ('"auto" tool choice requires --enable-auto-tool-choice and
+# --tool-call-parser to be set').
+#
+# The parser must match the checkpoint's chat template. `qwen3_xml` (vLLM's
+# Qwen3EngineToolParser) is the one recipes.vllm.ai documents for Qwen3.8-27B.
+# `hermes` does NOT work here: the request returns 200 but tool_calls comes back
+# null and the raw markup leaks into `content`. Set TOOL_PARSER="" to disable
+# tool serving entirely.
+TOOL_PARSER=${TOOL_PARSER-qwen3_xml}
+# The rust API frontend is what recipes.vllm.ai pairs with this model, but it
+# needs the `vllm-rs` binary: with VLLM_RUST_FRONTEND_PATH=auto, envs.py raises
+# FileNotFoundError when vllm/vllm-rs is absent, and this tree was not built with
+# setuptools-rust. Off by default; set RUST_FRONTEND=1 once you build it.
+RUST_FRONTEND=${RUST_FRONTEND:-0}
 PORT=${PORT:-8001}
 
 # --- environment -------------------------------------------------------------
@@ -48,6 +63,9 @@ export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
 export SPT_NOENV=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_ENABLE_V1_MULTIPROCESSING=1
+if [ "$RUST_FRONTEND" = "1" ]; then
+  export VLLM_USE_RUST_FRONTEND=1
+fi
 # Persistent compile cache: without it every restart pays the full ~3.7 min
 # startup again. The benchmark script uses /tmp, which is wiped.
 export VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT:-${HOME:-/root}/.cache/vllm_gfx1151_qwen38}
@@ -56,6 +74,9 @@ export VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT:-${HOME:-/root}/.cache/vllm_gfx1151_qwe
 # and carry most of the measured speedup, so they must be set explicitly.
 export VLLM_GFX1151_W4_LDS_TILE=${VLLM_GFX1151_W4_LDS_TILE:-1}   # +30% at C1
 export VLLM_GFX1151_W4_LOGITS=${VLLM_GFX1151_W4_LOGITS:-1}       # +8% at C1
+# Prefill-sized M (>=1024): stream-dequantize int4 weights to a bf16 workspace
+# and run rocBLAS mm (26.4 TF vs ~16 TF fused). -29% GEMM time per big chunk.
+export VLLM_GFX1151_W4_DEQUANT_MM=${VLLM_GFX1151_W4_DEQUANT_MM:-1}
 export VLLM_GFX1151_W4_LOGITS_TOPK=${VLLM_GFX1151_W4_LOGITS_TOPK:-256}
 # These three default to on in this tree; pinned here so the recipe is explicit.
 export VLLM_GFX1151_QWEN_ATTENTION=${VLLM_GFX1151_QWEN_ATTENTION:-1}
@@ -66,6 +87,23 @@ export VLLM_GFX1151_QWEN_VERIFY_SPLITKV=${VLLM_GFX1151_QWEN_VERIFY_SPLITKV:-1}
 # Must be >= --max-model-len or every tuned attention path silently switches off
 # at graph-capture time. See the recipe's "Context length" section.
 export VLLM_GFX1151_QWEN_MAX_CONTEXT=${VLLM_GFX1151_QWEN_MAX_CONTEXT:-$MAX_MODEL_LEN}
+
+# Reasoning parser: makes vLLM split the model's thinking out of `content` into
+# OpenAI's `reasoning_content`, which pi renders as a separate thinking block,
+# and it is what unlocks the `thinking_token_budget` request field. Empty means
+# thinking stays inline in the text (works, just less tidy).
+REASONING_PARSER=${REASONING_PARSER-qwen3}
+if [ -n "$REASONING_PARSER" ]; then
+  REASONING_FLAGS="--reasoning-parser $REASONING_PARSER"
+else
+  REASONING_FLAGS=""
+fi
+
+if [ -n "$TOOL_PARSER" ]; then
+  TOOL_FLAGS="--enable-auto-tool-choice --tool-call-parser $TOOL_PARSER"
+else
+  TOOL_FLAGS=""
+fi
 
 if [ "$ENABLE_PREFIX_CACHING" = "1" ]; then
   PREFIX_CACHING_FLAG="--enable-prefix-caching"
@@ -89,6 +127,8 @@ exec /opt/venv/bin/vllm serve "$MODEL" \
   --cpu-offload-gb 0 \
   --language-model-only --generation-config vllm \
   ${PREFIX_CACHING_FLAG} \
+  ${TOOL_FLAGS} \
+  ${REASONING_FLAGS} \
   --compilation-config '{"inductor_compile_config":{"deterministic":true,"combo_kernels":false,"benchmark_combo_kernel":false}}' \
   --speculative-config "{\"model\":\"${DRAFT_MODEL}\",\"revision\":\"${DRAFT_REVISION}\",\"method\":\"dflash\",\"num_speculative_tokens\":${SPEC_TOKENS}}" \
   --host 127.0.0.1 --port "$PORT" "$@" >>"$LOG" 2>&1

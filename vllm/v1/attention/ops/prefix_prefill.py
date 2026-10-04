@@ -228,8 +228,19 @@ def _fwd_kernel(
     acc = tl.zeros([BLOCK_M, BLOCK_DMODEL_PADDED], dtype=tl.float32)  # [M,D]
 
     # compute query against context (no causal mask here)
+    if SLIDING_WINDOW > 0 and not USE_SINKS:
+        # Restrict the context loop to the trailing sliding window. Fully
+        # masked blocks contribute nothing mathematically, but their K/V are
+        # still loaded: after sliding-window eviction (prefix caching on),
+        # those positions may map to null or recycled blocks holding Inf
+        # garbage, and 0 * Inf = NaN poisons the whole accumulator row.
+        # Skipping the out-of-window span avoids the loads entirely.
+        ctx_loop_start = tl.maximum(cur_batch_ctx_len - SLIDING_WINDOW + 1, 0)
+        ctx_loop_start = ctx_loop_start // BLOCK_SIZE * BLOCK_SIZE
+    else:
+        ctx_loop_start = 0
     for start_n in tl.range(
-        0, cur_batch_ctx_len, BLOCK_SIZE, loop_unroll_factor=num_unroll_cache
+        ctx_loop_start, cur_batch_ctx_len, BLOCK_SIZE, loop_unroll_factor=num_unroll_cache
     ):
         # Under a block size of 544 (Qwen/Qwen3-Next-80B-A3B-Thinking),
         # replace one physical block every 17 32-Tile blocks

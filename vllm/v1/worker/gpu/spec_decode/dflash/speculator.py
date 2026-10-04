@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import os
+import time
 from typing import Any
 
 import torch
@@ -30,6 +32,10 @@ from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+# Debug instrumentation: per-propose summary of context KV writes and timings.
+# Enabled with VLLM_DFLASH_DEBUG=1. Forces device syncs; never enable in prod.
+_DFLASH_DBG = bool(int(os.environ.get("VLLM_DFLASH_DEBUG", "0")))
 
 
 class DFlashSpeculator(DraftModelSpeculator):
@@ -282,6 +288,18 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
         num_sample = num_reqs * self.num_speculative_steps
         sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
+        if _DFLASH_DBG and not torch.cuda.is_current_stream_capturing():
+            self._dbg_gen_calls = getattr(self, "_dbg_gen_calls", 0) + 1
+            if self._dbg_gen_calls % 20 == 3:
+                h = sample_hidden_states.float()
+                logger.info(
+                    "DFLASH_DBG gen call=%d h_absmean=%.4f h_nan=%d h_row0=%s h_rowN=%s",
+                    self._dbg_gen_calls,
+                    h.abs().mean().item(),
+                    int(torch.isnan(h).sum().item()),
+                    [round(x, 3) for x in h[0, :3].tolist()],
+                    [round(x, 3) for x in h[-1, :3].tolist()],
+                )
         # sample_pos is the predicted token's position P. Sampling keys a draw
         # by the position before the sampled token, P-1.
         draft_tokens = self.sample_draft(
@@ -296,6 +314,18 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.draft_tokens[:num_reqs] = draft_tokens.view(
             num_reqs, self.num_speculative_steps
         )
+        if (
+            _DFLASH_DBG
+            and getattr(self, "_dbg_gen_calls", 0) % 20 == 3
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            lg = self.draft_logits[:num_sample].float()
+            logger.info(
+                "DFLASH_DBG logits absmean=%.4f nan=%d row0_top=%s",
+                lg.abs().mean().item(),
+                int(torch.isnan(lg).sum().item()),
+                torch.topk(lg[0], 3).indices.tolist() if lg.shape[0] else [],
+            )
 
     @torch.inference_mode()
     def propose(
@@ -420,11 +450,63 @@ class DFlashSpeculator(DraftModelSpeculator):
             ]
         else:
             context_slots = self._context_slot_mappings[0][:num_target_tokens]
+        if _DFLASH_DBG:
+            torch.cuda.synchronize()
+            _dbg_t0 = time.perf_counter()
         self.model.precompute_and_store_context_kv(
             self.hidden_states[:num_target_tokens],
             self.context_positions[:num_target_tokens],
             context_slots,
         )
+        if _DFLASH_DBG:
+            torch.cuda.synchronize()
+            _dbg_t1 = time.perf_counter()
+            _gid = self.draft_kv_cache_group_id
+            _tbl = self.block_tables.input_block_tables[_gid]
+            _nt = num_target_tokens
+            _cpos = self.context_positions[:_nt]
+            _cslot = self._context_slot_mappings[0][:_nt]
+            _nr = num_rejected[:num_reqs].tolist()
+            _ns = num_sampled[:num_reqs].tolist()
+            # Window coverage: which draft-group blocks back the trailing
+            # sliding window the draft attention will read, and are they null?
+            _seq0 = self.input_buffers.seq_lens[0].item() if num_reqs else 0
+            _kbs = self.block_tables.kernel_block_sizes[_gid]
+            _row = _tbl[0].tolist() if num_reqs else []
+            _w_start = max(0, _seq0 - 2047)
+            _w_blocks = sorted({p // _kbs for p in range(_w_start, _seq0 + 8, 64)})
+            _w_ids = [(_b, _row[_b] if _b < len(_row) else -1) for _b in _w_blocks[:6]]
+            logger.info(
+                "DFLASH_DBG reqs=%d nt=%d num_sampled=%s num_rejected=%s "
+                "ctx_pos=[%d..%d] pad_slots=%d/%d tbl_stride=%d kbs=%d "
+                "max_seq=%d draft_seq_lens=%s",
+                num_reqs,
+                _nt,
+                _ns,
+                _nr,
+                int(_cpos.min().item()) if _nt else -1,
+                int(_cpos.max().item()) if _nt else -1,
+                int((_cslot == PAD_SLOT_ID).sum().item()),
+                _nt,
+                _tbl.stride(0),
+                self.block_tables.kernel_block_sizes[_gid],
+                max_seq_len,
+                self.input_buffers.seq_lens[:num_reqs].tolist(),
+            )
+            if _nt <= 16 and not torch.cuda.is_current_stream_capturing():
+                if num_reqs >= 1 and _seq0 > 1024:
+                    self._dbg_scan = getattr(self, "_dbg_scan", 0) + 1
+                    if self._dbg_scan <= 4:
+                        self._dbg_scan_window(_tbl, _gid)
+            if num_reqs == 1 and _nt <= 8:
+                logger.info(
+                    "DFLASH_DBG window seq=%d w_start=%d kbs=%d tbl_head=%s window_blocks(block,id)=%s",
+                    _seq0,
+                    _w_start,
+                    _kbs,
+                    _row[:10],
+                    _w_ids,
+                )
 
         batch_sync, num_batch_tokens = (
             self._build_uniform_batch_dp_sync(dp_sync, num_reqs, self.num_query_per_req)
@@ -479,7 +561,62 @@ class DFlashSpeculator(DraftModelSpeculator):
                 cudagraph_runtime_mode=batch_desc.cg_mode,
             )
 
+        if _DFLASH_DBG:
+            torch.cuda.synchronize()
+            _dbg_t2 = time.perf_counter()
+            logger.info(
+                "DFLASH_DBG timing precompute=%.1fms draft_fwd=%.1fms cg=%s",
+                (_dbg_t1 - _dbg_t0) * 1e3,
+                (_dbg_t2 - _dbg_t1) * 1e3,
+                batch_desc.cg_mode,
+            )
+            if num_target_tokens <= 16 and num_reqs >= 1:
+                logger.info(
+                    "DFLASH_DBG tokens draft=%s bonus=%d qpos=%s qids=%s",
+                    self.draft_tokens[0].tolist(),
+                    int(last_sampled[input_batch.idx_mapping[0]].item()),
+                    self.input_buffers.positions[:8].tolist(),
+                    self.input_buffers.input_ids[:8].tolist(),
+                )
+
         return self.draft_tokens[:num_reqs]
+
+    def _dbg_scan_window(self, _tbl, _gid):
+        """Scan the draft KV window for NaN and report offending positions."""
+        from vllm.v1.attention.ops.paged_attn import PagedAttention
+
+        kbs = self.block_tables.kernel_block_sizes[_gid]
+        seq = int(self.input_buffers.seq_lens[0].item())
+        model = self.model.model
+        nkv, hd = model._num_kv_heads, model._head_dim
+        lo = max(0, seq - 2100)
+        pos = torch.arange(lo, seq + 8, device=_tbl.device)
+        blk = _tbl[0][pos // kbs].long()
+        for li, attn in enumerate(model._attn_layers):
+            kc, vc = PagedAttention.split_kv_cache(
+                attn.kv_cache.transpose(0, 1), nkv, hd
+            )
+            bs = kc.shape[3]
+            slot = blk * bs + (pos % kbs)
+            krows = kc.permute(0, 3, 1, 2, 4).reshape(-1, nkv * hd)[slot]
+            vrows = vc.permute(0, 3, 1, 2).reshape(-1, nkv * hd)[slot]
+            kn = torch.isnan(krows).any(dim=1)
+            vn = torch.isnan(vrows).any(dim=1)
+            logger.info(
+                "DFLASH_DBG scan L%d seq=%d span=[%d..%d] nanK=%d nanV=%d "
+                "firstKpos=%s firstVpos=%s nullblk=%d kabsmax=%.3f vabsmax=%.3f",
+                li,
+                seq,
+                lo,
+                seq + 8,
+                int(kn.sum().item()),
+                int(vn.sum().item()),
+                pos[kn][:6].tolist(),
+                pos[vn][:6].tolist(),
+                int((blk == 0).sum().item()),
+                krows.abs().max().item(),
+                vrows.abs().max().item(),
+            )
 
 
 @triton.jit
