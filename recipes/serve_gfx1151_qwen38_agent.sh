@@ -88,21 +88,62 @@ export VLLM_GFX1151_QWEN_VERIFY_SPLITKV=${VLLM_GFX1151_QWEN_VERIFY_SPLITKV:-1}
 # at graph-capture time. See the recipe's "Context length" section.
 export VLLM_GFX1151_QWEN_MAX_CONTEXT=${VLLM_GFX1151_QWEN_MAX_CONTEXT:-$MAX_MODEL_LEN}
 
-# Reasoning parser: makes vLLM split the model's thinking out of `content` into
-# OpenAI's `reasoning_content`, which pi renders as a separate thinking block,
-# and it is what unlocks the `thinking_token_budget` request field. Empty means
-# thinking stays inline in the text (works, just less tidy).
-REASONING_PARSER=${REASONING_PARSER-qwen3}
+# Reasoning parser: EMPTY BY DEFAULT - and that is load-bearing with the
+# patched chat template below. The qwen3 parser starts in reasoning mode (the
+# stock template opens <think> before generation), so with the patched
+# template's pre-closed empty think block it misclassifies the whole plain
+# answer as reasoning and DROPS it (verified: '391' -> content None,
+# reasoning_tokens 3). Without a parser: thinking-off answers stream as pure
+# content; an explicit enable_thinking=true request gets its thinking inline
+# in content (visible, nothing lost). Only set REASONING_PARSER=qwen3 together
+# with the STOCK template (CHAT_TEMPLATE="").
+REASONING_PARSER=${REASONING_PARSER-}
 if [ -n "$REASONING_PARSER" ]; then
   REASONING_FLAGS="--reasoning-parser $REASONING_PARSER"
 else
   REASONING_FLAGS=""
 fi
 
+# Chat template: the stock template turns thinking ON whenever a request omits
+# enable_thinking (default reasoning effort xhigh!), and --reasoning-parser then
+# DROPS the thinking from both content and reasoning_content - an invisible
+# 2-5x token/latency burn that shows up as ~7 tok/s in agent clients. The
+# patched copy flips the default to OFF (thinking only when a request explicitly
+# sends enable_thinking=true). Set CHAT_TEMPLATE="" to serve the stock template.
+CHAT_TEMPLATE=${CHAT_TEMPLATE-$REPO/recipes/qwen38_chat_template_thinking_off.jinja}
+if [ -n "$CHAT_TEMPLATE" ]; then
+  TEMPLATE_FLAGS="--chat-template $CHAT_TEMPLATE"
+else
+  TEMPLATE_FLAGS=""
+fi
+
 if [ -n "$TOOL_PARSER" ]; then
   TOOL_FLAGS="--enable-auto-tool-choice --tool-call-parser $TOOL_PARSER"
 else
   TOOL_FLAGS=""
+fi
+
+# --- KV tiering (native OffloadingConnector, Phase 1 validated) --------------
+# Set OFFLOAD_ROOT to enable the CPU+NVMe KV tiers: GPU pool evictions demote
+# through a CPU tier to chunk files under OFFLOAD_ROOT, and lookups promote
+# them back - including across full server restarts (filenames derive from
+# sha256 block hashes, the tree's default prefix-caching hash, so they are
+# process-independent). Evidence + sizing: benchmarks/results/
+# native_offload_phase1/STATUS.md. Restore latency is tail-re-prefill bound
+# (~1.7k tokens), not I/O bound, at current disk rates.
+#
+# OFFLOAD_ROOT="" (default) keeps the historical no-connector behavior.
+# cpu_bytes_to_use lives OUTSIDE the gpu-memory-utilization budget: at
+# GPU_MEM_UTIL=0.92 only ~7.5 GiB of RAM remains, hence the 4 GiB default.
+OFFLOAD_ROOT=${OFFLOAD_ROOT:-}
+OFFLOAD_CPU_GB=${OFFLOAD_CPU_GB:-4}
+OFFLOAD_READ_THREADS=${OFFLOAD_READ_THREADS:-8}
+OFFLOAD_WRITE_THREADS=${OFFLOAD_WRITE_THREADS:-8}
+KV_TRANSFER_ARG=()
+if [ -n "$OFFLOAD_ROOT" ]; then
+  mkdir -p "$OFFLOAD_ROOT"
+  OFFLOAD_CPU_BYTES=$(python3 -c "print(int(${OFFLOAD_CPU_GB} * 1073741824))")
+  KV_TRANSFER_ARG=(--kv-transfer-config "{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"spec_name\":\"TieringOffloadingSpec\",\"cpu_bytes_to_use\":${OFFLOAD_CPU_BYTES},\"blocks_per_chunk\":1,\"eviction_policy\":\"lru\",\"secondary_tiers\":[{\"type\":\"fs\",\"root_dir\":\"${OFFLOAD_ROOT}\",\"n_read_threads\":${OFFLOAD_READ_THREADS},\"n_write_threads\":${OFFLOAD_WRITE_THREADS}}]}}")
 fi
 
 if [ "$ENABLE_PREFIX_CACHING" = "1" ]; then
@@ -129,6 +170,8 @@ exec /opt/venv/bin/vllm serve "$MODEL" \
   ${PREFIX_CACHING_FLAG} \
   ${TOOL_FLAGS} \
   ${REASONING_FLAGS} \
+  ${TEMPLATE_FLAGS} \
+  "${KV_TRANSFER_ARG[@]}" \
   --compilation-config '{"inductor_compile_config":{"deterministic":true,"combo_kernels":false,"benchmark_combo_kernel":false}}' \
   --speculative-config "{\"model\":\"${DRAFT_MODEL}\",\"revision\":\"${DRAFT_REVISION}\",\"method\":\"dflash\",\"num_speculative_tokens\":${SPEC_TOKENS}}" \
   --host 127.0.0.1 --port "$PORT" "$@" >>"$LOG" 2>&1

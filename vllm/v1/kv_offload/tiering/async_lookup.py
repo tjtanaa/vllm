@@ -136,6 +136,21 @@ class AsyncLookupManager(ABC):
         """
         ...
 
+    def try_sync_lookup(self, key: OffloadKey) -> bool | None:
+        """Optional immediate single-key existence probe.
+
+        Tiers whose per-key existence check is cheap and local (e.g. a
+        filesystem tier on local NVMe: one stat, ~µs) may override this to
+        resolve first-encounter keys synchronously on the scheduler thread,
+        removing the one-step async latency for cold-start lookups — the
+        first request after a server restart would otherwise miss the tier
+        and recompute while the async verdict is still in flight.
+
+        Return None to keep the async path. Implementations must never
+        block on network or remote I/O.
+        """
+        return None
+
     # ------------------------------------------------------------------
     # Scheduler-thread API
     # ------------------------------------------------------------------
@@ -158,7 +173,14 @@ class AsyncLookupManager(ABC):
             state = LookupState(generation=self._next_generation)
             self._next_generation += 1
             self._lookup_state[key] = state
-            self._lookup_batch.append((key, req_context, state.generation))
+            sync_result = self.try_sync_lookup(key)
+            if sync_result is None:
+                self._lookup_batch.append((key, req_context, state.generation))
+            else:
+                # Resolved inline: never queued, so flush()/drain_results()
+                # (which assert PENDING/IN_FLIGHT) never see this key.
+                state.phase = LookupPhase.RESOLVED
+                state.result = sync_result
         state.request_ids.add(req_id)
         self._req_keys.setdefault(req_id, set()).add(key)
         return state.result

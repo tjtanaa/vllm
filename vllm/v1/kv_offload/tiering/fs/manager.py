@@ -82,6 +82,17 @@ class FsAsyncLookupManager(AsyncLookupManager):
             return batch_lookup_C(paths)
         return (os.path.exists(p) for p in paths)
 
+    def try_sync_lookup(self, key) -> "bool | None":
+        # Single local stat (~µs on NVMe): safe on the scheduler thread and
+        # removes the one-step async latency for first-encounter keys, so the
+        # first request after a restart restores from disk instead of
+        # recomputing. OSError (e.g. tier temporarily unavailable) falls back
+        # to the async path.
+        try:
+            return os.path.exists(self._tier.file_mapper.get_file_name(key))
+        except OSError:
+            return None
+
 
 class FileSystemTierManager(SecondaryTierManager):
     """
