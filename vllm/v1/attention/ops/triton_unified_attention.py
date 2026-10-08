@@ -7,6 +7,7 @@
 #  - Chih-Chieh Yang <chih.chieh.yang@ibm.com>
 #  - Thomas Parnell <tpa@zurich.ibm.com>
 
+import os
 from typing import Any
 
 import torch
@@ -967,6 +968,36 @@ def unified_attention(
         launch_num_warps = 8
         launch_num_stages = 2
 
+    # Per-shape tuning overrides (used on gfx1151 where the shipped defaults
+    # under-occupy RDNA wave slots).  All are no-ops unless the matching
+    # environment variable is set, so default behavior is unchanged.
+    _ovr_block_m = os.environ.get("VLLM_TRITON_ATTN_BLOCK_M")
+    # Phase-specific variants win over the shared one.  "verify" batches
+    # (speculative-decode verification, q_len <= 1 + num_spec_tokens) keep the
+    # decode-style defaults: wide BLOCK_M tiles help long prefills but hurt
+    # 1-kv-head-group verification grids.
+    _prefill_qmin = int(os.environ.get("VLLM_TRITON_ATTN_PREFILL_QMIN", "8"))
+    _ovr_block_m_phase = os.environ.get(
+        "VLLM_TRITON_ATTN_BLOCK_M_PREFILL"
+        if max_seqlen_q > _prefill_qmin
+        else "VLLM_TRITON_ATTN_BLOCK_M_DECODE"
+    )
+    if _ovr_block_m_phase:
+        _ovr_block_m = _ovr_block_m_phase
+    if _ovr_block_m:
+        BLOCK_M = int(_ovr_block_m)
+        assert BLOCK_M % num_queries_per_kv == 0, (
+            f"BLOCK_M={BLOCK_M} must be divisible by "
+            f"num_queries_per_kv={num_queries_per_kv}"
+        )
+        BLOCK_Q = BLOCK_M // num_queries_per_kv
+    _ovr_warps = os.environ.get("VLLM_TRITON_ATTN_NUM_WARPS")
+    if _ovr_warps:
+        launch_num_warps = int(_ovr_warps)
+    _ovr_stages = os.environ.get("VLLM_TRITON_ATTN_NUM_STAGES")
+    if _ovr_stages:
+        launch_num_stages = int(_ovr_stages)
+
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
     # However, it is slow to realize the query_lens on cpu.
@@ -999,6 +1030,19 @@ def unified_attention(
     # path (used when max_seqlen_q > 1) reads TILE_SIZE_PREFILL.
     if tuned_large_head:
         TILE_SIZE_PREFILL = 128
+
+    _ovr_tile_prefill = os.environ.get(
+        "VLLM_TRITON_ATTN_TILE_PREFILL"
+        if max_seqlen_q > int(os.environ.get("VLLM_TRITON_ATTN_PREFILL_QMIN", "8"))
+        else "VLLM_TRITON_ATTN_TILE_DECODE"
+    )
+    if _ovr_tile_prefill:
+        TILE_SIZE_PREFILL = int(_ovr_tile_prefill)
+    _ovr_tile_decode = os.environ.get("VLLM_TRITON_ATTN_TILE_DECODE")
+    if _ovr_tile_decode and max_seqlen_q <= int(
+        os.environ.get("VLLM_TRITON_ATTN_PREFILL_QMIN", "8")
+    ):
+        TILE_SIZE_DECODE = int(_ovr_tile_decode)
 
     # USE_TD requires BLOCK_SIZE % TILE_SIZE == 0 (enforced by a
     # ``tl.static_assert`` in the kernel).  The default prefill tile
@@ -1051,13 +1095,21 @@ def unified_attention(
     # 2. The batch includes at least one prefill request, or
     # 3. The number of sequences exceeds the configured threshold, or
     # 4. Batch invariance is enabled
+    force_3d = (
+        os.environ.get("VLLM_TRITON_ATTN_FORCE_3D") == "1"
+        # scratch rows are sized seq_threshold_3D tokens (1 token/seq for the
+        # classic decode case); speculative verify batches add up (seqs x q).
+        # Keep them within capacity, otherwise fall back to the 2D path.
+        and seq_threshold_3D is not None
+        and q.shape[0] <= seq_threshold_3D
+    )
     use_3d = not (
         seq_threshold_3D is None
         or num_par_softmax_segments is None
         or softmax_segm_output is None
         or softmax_segm_max is None
         or softmax_segm_expsum is None
-        or max_seqlen_q > 1
+        or (max_seqlen_q > 1 and not force_3d)
         or num_seqs > seq_threshold_3D
         or is_batch_invariant
     )

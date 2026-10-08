@@ -11,9 +11,28 @@ from datetime import datetime
 from itertools import product
 from typing import Any, TypedDict
 
-import ray
+try:
+    import ray
+except Exception:  # pragma: no cover - ray is optional for local tuning
+    ray = None
 import torch
-from ray.experimental.tqdm_ray import tqdm
+
+try:
+    from ray.experimental.tqdm_ray import tqdm as _ray_tqdm
+except Exception:  # pragma: no cover
+    _ray_tqdm = None
+
+# Local (no-Ray) tuning mode: set VLLM_MOE_TUNE_LOCAL=1 to run the tuner in
+# the current process.  Useful on single-GPU hosts where a Ray head either
+# does not detect the device or fails to start.
+LOCAL_MODE = os.environ.get("VLLM_MOE_TUNE_LOCAL") == "1"
+
+
+def tqdm(iterable, *args, **kwargs):
+    """Ray-aware progress bar with a plain iterator fallback."""
+    if LOCAL_MODE or _ray_tqdm is None:
+        return iterable
+    return _ray_tqdm(iterable, *args, **kwargs)
 
 from vllm.model_executor.layers.fused_moe import fused_topk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -553,16 +572,28 @@ def merge_unique_dicts(list1, list2):
     return result
 
 
-@ray.remote(num_gpus=1)
+# Adapated benchmark worker:
+# - usable in-process (VLLM_MOE_TUNE_LOCAL=1) when Ray is unavailable
+# - tolerates a missing Ray GPU id on hosts without Ray GPU detection
 class BenchmarkWorker:
-    def __init__(self, seed: int) -> None:
+    def __init__(self, seed: int, device_id: int | None = None) -> None:
         torch.set_default_device(current_platform.device_type)
         set_random_seed(seed)
         self.seed = seed
-        # Get the device ID to allocate tensors and kernels
-        # on the respective GPU. This is required for Ray to work
-        # correctly with multi-GPU tuning on the ROCm platform.
-        self.device_id = int(ray.get_gpu_ids()[0])
+        if device_id is not None:
+            self.device_id = device_id
+        elif LOCAL_MODE or ray is None:
+            # Local tuning mode: never touch Ray (it would try to start a
+            # CoreWorker against a non-existent cluster).
+            self.device_id = 0
+        else:
+            # Get the device ID to allocate tensors and kernels
+            # on the respective GPU. This is required for Ray to work
+            # correctly with multi-GPU tuning on the ROCm platform.
+            try:
+                self.device_id = int(ray.get_gpu_ids()[0])
+            except Exception:
+                self.device_id = 0
 
     def benchmark(
         self,
@@ -711,6 +742,11 @@ class BenchmarkWorker:
         return best_config
 
 
+RemoteBenchmarkWorker = (
+    ray.remote(num_gpus=1)(BenchmarkWorker) if ray is not None else None
+)
+
+
 def sort_config(config: BenchmarkConfig) -> BenchmarkConfig:
     return {
         "BLOCK_SIZE_M": config["BLOCK_SIZE_M"],
@@ -842,6 +878,17 @@ def get_model_params(config):
         topk = text_config.top_k_experts
         intermediate_size = text_config.moe_intermediate_size
         hidden_size = text_config.hidden_size
+    elif architecture == "Gemma4ForConditionalGeneration":
+        # Gemma 4 26B-A4B: the MoE lives in the text config, and the Triton
+        # kernel config file name uses N = w2.shape[2] = moe_intermediate_size.
+        # main() derives shard_intermediate_size = 2 * intermediate / tp, so
+        # return moe_intermediate_size to land on the runtime's E=..,N=704 name
+        # when tp_size == 1.
+        text_config = config.get_text_config()
+        E = text_config.num_experts
+        topk = text_config.top_k_experts
+        intermediate_size = text_config.moe_intermediate_size
+        hidden_size = text_config.hidden_size
     elif architecture == "HunYuanMoEV1ForCausalLM":
         E = config.num_experts
         topk = config.moe_topk[0]
@@ -881,9 +928,9 @@ def get_model_params(config):
 
 
 def resolve_dtype(config) -> torch.dtype:
-    if current_platform.is_rocm():
-        return torch.float16
-
+    # Prefer the checkpoint dtype (bfloat16 for Gemma 4) so the tuner measures
+    # the kernels the server actually runs.  Keep the old ROCm float16
+    # default only as a fallback.
     dtype = getattr(config, "dtype", None)
     if dtype is not None:
         return dtype
@@ -893,6 +940,9 @@ def resolve_dtype(config) -> torch.dtype:
         dtype = getattr(text_config, "dtype", None)
         if dtype is not None:
             return dtype
+
+    if current_platform.is_rocm():
+        return torch.float16
 
     return torch.bfloat16
 
@@ -988,7 +1038,20 @@ def main(args: argparse.Namespace):
 
     use_deep_gemm = bool(args.use_deep_gemm)
 
-    if current_platform.is_rocm() and "HIP_VISIBLE_DEVICES" in os.environ:
+    use_ray = not (LOCAL_MODE or ray is None)
+
+    if not use_ray:
+        # Run in-process: no Ray head needed (local tuning mode).
+        workers = [BenchmarkWorker(args.seed)]
+
+        def _distribute(method: str, inputs: list[Any]) -> list[Any]:
+            return [getattr(workers[0], method)(*input_args) for input_args in inputs]
+
+    if (
+        use_ray
+        and current_platform.is_rocm()
+        and "HIP_VISIBLE_DEVICES" in os.environ
+    ):
         # Ray will set ROCR_VISIBLE_DEVICES for device visibility
         logger.warning(
             "Ray uses ROCR_VISIBLE_DEVICES to control device accessibility."
@@ -998,20 +1061,21 @@ def main(args: argparse.Namespace):
         os.environ["ROCR_VISIBLE_DEVICES"] = val
         del os.environ["HIP_VISIBLE_DEVICES"]
 
-    ray.init()
-    num_gpus = int(ray.available_resources()["GPU"])
-    workers = [BenchmarkWorker.remote(args.seed) for _ in range(num_gpus)]
+    if use_ray:
+        ray.init()
+        num_gpus = int(ray.available_resources()["GPU"])
+        workers = [RemoteBenchmarkWorker.remote(args.seed) for _ in range(num_gpus)]
 
-    def _distribute(method: str, inputs: list[Any]) -> list[Any]:
-        outputs = []
-        worker_idx = 0
-        for input_args in inputs:
-            worker = workers[worker_idx]
-            worker_method = getattr(worker, method)
-            output = worker_method.remote(*input_args)
-            outputs.append(output)
-            worker_idx = (worker_idx + 1) % num_gpus
-        return ray.get(outputs)
+        def _distribute(method: str, inputs: list[Any]) -> list[Any]:
+            outputs = []
+            worker_idx = 0
+            for input_args in inputs:
+                worker = workers[worker_idx]
+                worker_method = getattr(worker, method)
+                output = worker_method.remote(*input_args)
+                outputs.append(output)
+                worker_idx = (worker_idx + 1) % num_gpus
+            return ray.get(outputs)
 
     if args.tune:
         # int4_w4a16 weights are uint8-packed, not fp16; treat like fp8 for

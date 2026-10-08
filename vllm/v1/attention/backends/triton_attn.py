@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """High-Performance Triton-only Attention layer."""
 
+import os
 from dataclasses import dataclass, replace
 from typing import ClassVar
 
@@ -151,7 +152,9 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
                 key=lambda x: abs(x - self.seq_threshold_3D),
             )
 
-        self.num_par_softmax_segments = NUM_PAR_SOFTMAX_SEGMENTS
+        self.num_par_softmax_segments = int(
+            os.environ.get("VLLM_TRITON_ATTN_SEGMENTS", NUM_PAR_SOFTMAX_SEGMENTS)
+        )
         # On SM120, batches whose 16-segment grid under-fills the SMs use 64.
         self.max_seqs_64_segments = 0
         if current_platform.is_cuda() and current_platform.is_device_capability(
