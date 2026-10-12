@@ -389,3 +389,40 @@ def test_minimax_m3_fp8_target_indexer_and_eagle_pages_roundtrip(tmp_path, devic
         assert torch.equal(storage, expected)
     finally:
         worker.close()
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda:0"])
+def test_mori_scheduler_clear_allows_fresh_store_and_restore(tmp_path, device):
+    """Successful reset must reopen native stores, not silently discard offload."""
+    pytest.importorskip("mori.cpp")
+    if device != "cpu":
+        if not torch.accelerator.is_available():
+            pytest.skip("requires a ROCm GPU")
+        torch.accelerator.set_device_index(0)
+    runtime = EmbeddedRuntime.from_config(
+        UMBPRuntimeConfig(
+            "embedded", {"capacity_bytes": 16 << 20, "lookup_dir": str(tmp_path)}
+        )
+    )
+    topology = RankTopology()
+    scheduler = runtime.create_scheduler_handle("reset-test", topology, _layout())
+    worker = runtime.create_worker_handle("reset-test", topology, _layout())
+    source = torch.empty(16, dtype=torch.uint8, device=device)
+    destination = torch.zeros_like(source)
+    worker.register_buffers({"layer0": source, "output": destination})
+    try:
+        for cycle in range(3):
+            source.fill_(cycle + 1)
+            stored = worker.wait(worker.store([_plan("reset-key", source)]))
+            assert stored.status is TransferJobStatus.COMPLETED
+            worker.publish(stored)
+            assert scheduler.lookup(["reset-key"]) == [True]
+            destination.zero_()
+            loaded = worker.wait(worker.load([_plan("reset-key", destination)]))
+            assert loaded.status is TransferJobStatus.COMPLETED
+            assert torch.equal(source, destination)
+            assert scheduler.clear()
+            assert scheduler.lookup(["reset-key"]) == [False]
+    finally:
+        worker.close()
+        scheduler.close()

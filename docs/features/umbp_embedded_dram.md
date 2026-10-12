@@ -254,6 +254,9 @@ caches, and `Inferact/MiniMax-M3-EAGLE3-GQA` with three speculative tokens:
 - Build MoRI with `BUILD_UMBP=ON` and gRPC/Protobuf development dependencies.
   Confirm the native `UMBPClient`, `UMBPConfig`, and `MemoryLocationType`
   exports, memory registration, and ranged-pointer transfer methods.
+  Also validate a native store, clear, fresh store, and restore cycle. MoRI
+  v1.2.4 requires the no-master clear acknowledgment fix; otherwise reset
+  reports success but subsequent embedded stores fail with `CLEAR_PENDING`.
 - Build the `vllm._rust_tool_parser` extension when serving with
   `--tool-call-parser minimax_m3`; the Python server requires it too.
 - Use AITER with the MiniMax MSA score/top-k kernels. The ROCm base-image
