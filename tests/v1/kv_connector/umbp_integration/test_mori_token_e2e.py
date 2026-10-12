@@ -249,6 +249,50 @@ def test_mori_hybrid_restore_after_gpu_reset(tmp_path, lazy):
         assert count(metrics(), "umbp_transfer_completed", "load") == count(
             before_clear_replay, "umbp_transfer_completed", "load"
         )
+        # Regression: connector clear must permit fresh stores and restores.
+        # Match the native cached execution path before testing external replay.
+        before_reset_native = metrics()
+        native_after_reset = llm.generate(prompt, sampling, use_tqdm=False)[0]
+        after_reset_native = metrics()
+        if lazy:
+            _flush_gpu_cache(llm, SamplingParams(max_tokens=1, temperature=0))
+        # Waiting for GPU-only reset drains stores without clearing the backend.
+        reset_cache(reset_connector=False)
+        after_reset_store = metrics()
+        report["reset_cycle"] = {
+            "before_store": before_clear_replay,
+            "after_store": after_reset_store,
+            "cold_after_clear": result(cleared),
+            "native_after_clear": result(native_after_reset),
+            "before_native": before_reset_native,
+            "after_native": after_reset_native,
+        }
+        replay = llm.generate(prompt, sampling, use_tqdm=False)[0]
+        after_reset_restore = metrics()
+        report["reset_cycle"].update(
+            {
+                "restored": result(replay),
+                "after_restore": after_reset_restore,
+            }
+        )
+        assert count(after_reset_native, "umbp_transfer_failed") == 0
+        assert count(after_reset_store, "umbp_transfer_failed") == 0
+        assert count(after_reset_store, "umbp_transfer_completed", "store") > count(
+            before_clear_replay, "umbp_transfer_completed", "store"
+        ), "no successful UMBP stores after connector reset"
+        assert count(after_reset_restore, "umbp_transfer_failed") == 0
+        assert replay.num_cached_tokens == native_after_reset.num_cached_tokens > 0
+        assert count(after_reset_restore, "umbp_transfer_completed", "load") > count(
+            after_reset_store, "umbp_transfer_completed", "load"
+        ), "no UMBP restore after post-reset stores"
+        assert count(after_reset_native, "umbp_transfer_completed", "load") == count(
+            before_reset_native, "umbp_transfer_completed", "load"
+        )
+        assert replay.outputs[0].token_ids == native_after_reset.outputs[0].token_ids
+        assert replay.outputs[0].token_ids == cleared.outputs[0].token_ids
+        assert result(replay)["logprobs"] == pytest.approx(
+            result(native_after_reset)["logprobs"], abs=0.01
+        )
     finally:
         destination = Path(os.environ.get("VLLM_UMBP_EVIDENCE_DIR", str(tmp_path)))
         destination.mkdir(parents=True, exist_ok=True)
