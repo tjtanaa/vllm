@@ -90,9 +90,23 @@ The embedded adapter needs `mori.cpp.UMBPClient`, `UMBPConfig`, and
 `batch_exists`, `flush`, and `clear` methods. A MORI package without its UMBP
 bindings is insufficient, even if its version is recent.
 
-One reproducible ROCm build uses MORI v1.2.4, commit
-`f39fa765e897c95995957d0518908cc982a88fc2`. In an isolated Ubuntu development
-container with the vLLM virtual environment and ROCm toolchain available:
+The validated ROCm dependency is MORI v1.2.4, base commit
+`f39fa765e897c95995957d0518908cc982a88fc2`, plus the bundled
+[`mori-no-master-reset.patch`](../../tools/umbp/mori-no-master-reset.patch).
+The repair was authored as MORI commit
+`cd9772b5944976926950f54ebbc4794077ffde54` and includes a repeated native
+store/clear/store/restore regression. Its source tree is
+`99e1f525ff0c2e9c0ba585127c30b37fcec92b4f`; applying the patch with different
+committer metadata can change the commit ID while preserving this tree.
+
+The unpatched base leaves embedded allocations blocked with `CLEAR_PENDING`
+after `clear()`: cache misses still recompute, but subsequent stores fail.
+The repair acknowledges local clear when no master is configured and preserves
+the master-backed acknowledgment path. Use the repaired dependency for cache
+reset support.
+
+From the vLLM repository root, in an isolated Ubuntu development container with
+the virtual environment and ROCm toolchain available:
 
 ```bash
 apt-get update
@@ -100,9 +114,12 @@ apt-get install -y libgrpc-dev libgrpc++-dev libprotobuf-dev \
   protobuf-compiler protobuf-compiler-grpc
 git clone --branch v1.2.4 --depth 1 --recursive https://github.com/ROCm/mori.git
 test "$(git -C mori rev-parse HEAD)" = f39fa765e897c95995957d0518908cc982a88fc2
-BUILD_UMBP=ON GPU_TARGETS=gfx950 PYTORCH_ROCM_ARCH=gfx950 MAX_JOBS=8 \
+git -C mori am ../tools/umbp/mori-no-master-reset.patch
+test "$(git -C mori rev-parse 'HEAD^{tree}')" = 99e1f525ff0c2e9c0ba585127c30b37fcec92b4f
+BUILD_UMBP=ON GPU_TARGETS=gfx950 PYTORCH_ROCM_ARCH=gfx950 \
   uv pip install --python .venv/bin/python --no-build-isolation --no-deps ./mori
 .venv/bin/python -c 'from mori.cpp import UMBPClient, UMBPConfig, MemoryLocationType; assert all(hasattr(UMBPClient, m) for m in ("register_memory", "deregister_memory", "batch_get_ranges_into_ptr", "batch_put_ranges_from_ptr", "batch_exists", "flush", "clear"))'
+.venv/bin/python -m pytest -q mori/tests/python/umbp/test_umbp_client_ptr.py
 ```
 
 Use the target architecture of the machine in place of `gfx950`. Building from
@@ -116,7 +133,11 @@ The AMD Qwen4Exp QSA implementation accepts `UMBPStoreConnector`. Use
 (`enable_partial_hash_hits=false`). Hybrid loads complete before the request
 resumes, even if `load_async=false` was requested. On the validated ROCm
 7.2.3 / AITER 0.1.24.post1 image, select Triton MoE as in the recipe below: the default
-AITER MoE warmup rejected this model's TP=4 GEMM shape.
+AITER MoE warmup rejected this model's TP=4 GEMM shape. TP=8 with explicit
+AITER MoE also failed during weight preparation: the local expert width of 80
+does not satisfy the weight shuffle's multiple-of-32 requirement. The same
+failure occurs without UMBP. The model's separate attention backend is
+`QWEN4_EXP_QSA_TRITON`.
 
 UMBP stores the main attention cache, compressed QSA keys, GDN state, and PLE
 short-convolution state. The raw-key circular buffer is deliberately not
@@ -147,13 +168,22 @@ identical tokens and the expected answer. External and repeated native-prefix
 log probabilities must agree with the native-prefix baseline within 0.01.
 Cacheable filler requests apply GPU eviction pressure before a GPU-cache reset;
 completed external-load counters must increase with no transfer failures. A final
-connector reset must force recomputation. `VLLM_UMBP_EVIDENCE_DIR` optionally
-retains the responses and transfer-counter snapshots.
+connector reset must force recomputation, permit fresh successful stores, and
+allow another external restore after clearing the GPU cache. Each post-reset
+stage must remain free of transfer failures; restored output is compared with
+a matched native-prefix baseline. `VLLM_UMBP_EVIDENCE_DIR` optionally retains the
+responses and transfer-counter snapshots.
 
 This focused test does not establish general accuracy or bitwise parity. On the
 validated BF16 stack, highly repetitive long prompts showed probability variation
 and occasional greedy-token changes even during native GPU prefix reuse. Those
-workloads need additional model-backend evaluation.
+workloads need additional model-backend evaluation. A focused trace found
+different ROCm QSA top-k ordering despite identical scores and selected token
+sets. Test-only canonical ordering removed the layer-3 QSA and downstream
+differences for three repetitive prompts, including UMBP restores. Production
+ordering remains unchanged; this counterfactual is neither a performance result
+nor evidence of broad model accuracy. The recipe uses `enforce_eager=True`;
+eager/lazy offloading describes the transfer policy, not graph execution.
 
 The following embedded options are supported:
 
