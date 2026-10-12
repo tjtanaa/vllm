@@ -45,7 +45,6 @@ from .data import (
     BlockIdentityCodec,
     BlockLoadBatch,
     BlockTransferPlan,
-    KVLayoutPlanner,
     LoadSpec,
     RankTopology,
     RequestTracker,
@@ -173,7 +172,12 @@ class UMBPStoreConnectorScheduler:
             and vllm_config.kv_events_config.enable_kv_cache_events
         )
         self.codec = codec
-        self.layout = KVLayoutPlanner.from_kv_cache_config(kv_cache_config)
+        self.layer_groups = {
+            layer_name: group_id
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+            if group.enable_kv_transfer
+            for layer_name in group.layer_names
+        }
         self.topology = topology or RankTopology()
         transfer_config = vllm_config.kv_transfer_config
         assert transfer_config is not None
@@ -181,6 +185,10 @@ class UMBPStoreConnectorScheduler:
         self.load_async = bool(extra.get("load_async", True))
         if not self.load_async and (
             len(kv_cache_config.kv_cache_groups) > 1
+            or (
+                vllm_config.speculative_config is not None
+                and vllm_config.speculative_config.use_eagle_block_drop()
+            )
             or any(
                 isinstance(spec, MambaSpec)
                 or getattr(spec, "cache_role", None) == SparseCacheRole.INDEXER
@@ -191,7 +199,7 @@ class UMBPStoreConnectorScheduler:
             # State/indexer layers read their caches before attention's wait
             # hook. Core also recovers multi-group failures at request level.
             logger.warning(
-                "UMBP requires asynchronous loads for hybrid/state caches; "
+                "UMBP requires asynchronous loads for hybrid/state/draft caches; "
                 "load_async=false is ignored"
             )
             self.load_async = True
@@ -253,7 +261,7 @@ class UMBPStoreConnectorScheduler:
                 ),
                 allow_partial_hash_hits=self.enable_partial_hash_hits,
             )
-            if len(lookup_groups) > 1
+            if len(lookup_groups) > 1 or use_eagle
             else None
         )
         self._lookup_pool = _LookupBlockPool(self.hash_block_size)
@@ -862,9 +870,9 @@ class UMBPStoreConnectorScheduler:
         """Expose layer ownership without changing bulk plan semantics."""
         for plan in meta.store_plans:
             layer_names = {item.layer_name for item in plan.ranges} or {
-                region.layer_name
-                for region in self.layout.regions
-                if plan.group_id is None or region.group_id == plan.group_id
+                layer_name
+                for layer_name, group_id in self.layer_groups.items()
+                if plan.group_id is None or group_id == plan.group_id
             }
             for layer_name in layer_names:
                 meta.store_plans_by_layer.setdefault(layer_name, []).append(plan)

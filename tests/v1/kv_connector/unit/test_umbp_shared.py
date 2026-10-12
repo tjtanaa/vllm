@@ -3215,3 +3215,49 @@ def test_minimax_m3_eagle_lookup_requires_every_cache_on_every_rank(
         assert result == ((384, True) if missing_group is None else (0, False))
     finally:
         scheduler.close()
+
+
+def test_minimax_scheduler_accepts_collapsed_mixed_page_specs(monkeypatch):
+    """Core's scheduler spec is representative, not each layer's physical page."""
+    from tests.v1.kv_connector.umbp_test_utils import (
+        install_memory_runtime,
+        minimax_m3_kv_cache_config,
+    )
+
+    runtime = install_memory_runtime(monkeypatch)
+    monkeypatch.setattr(
+        runtime, "create_scheduler_handle", lambda *_: _SchedulerHandle([True] * 3)
+    )
+    config = minimax_m3_kv_cache_config()
+    specs = {
+        group.layer_names[0]: group.kv_cache_spec for group in config.kv_cache_groups
+    }
+    config.kv_cache_groups = [
+        KVCacheGroupSpec(
+            list(specs),
+            UniformTypeKVCacheSpecs(block_size=128, kv_cache_specs=specs),
+        )
+    ]
+    for tensor in config.kv_cache_tensors:
+        page_bytes = specs[tensor.layers[0]].page_size_bytes
+        tensor.size = tensor.layer_stride = config.num_blocks * page_bytes
+        tensor.block_stride = page_bytes
+        tensor.offset = 0
+    scheduler_config = generate_scheduler_kv_cache_config([config])
+    vllm_config = _vllm_config({"mode": "embedded", "load_async": False})
+    vllm_config.speculative_config = SimpleNamespace(use_eagle_block_drop=lambda: True)
+    vllm_config.cache_config.block_size = 128
+    connector = UMBPStoreConnector(
+        vllm_config, KVConnectorRole.SCHEDULER, scheduler_config
+    )
+    try:
+        assert connector.get_num_new_matched_tokens(
+            SimpleNamespace(
+                request_id="mixed-pages",
+                block_hashes=[b"a", b"b", b"c"],
+                num_tokens=385,
+            ),
+            0,
+        ) == (256, True)
+    finally:
+        connector.connector_scheduler.close()

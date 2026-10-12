@@ -117,7 +117,13 @@ class UMBPStoreConnector(KVConnectorBase_V1, SupportsHMA):
             pcp_rank=topology.pcp_rank,
             dcp_rank=topology.dcp_rank,
         )
-        layout = KVLayoutPlanner.from_kv_cache_config(kv_cache_config)
+        # Core may replace per-layer geometry with a representative scheduler
+        # spec. Only workers have the physical page sizes needed for transfers.
+        layout = (
+            KVLayoutPlanner.from_kv_cache_config(kv_cache_config)
+            if role == KVConnectorRole.WORKER
+            else KVLayoutPlanner(())
+        )
         layout_descriptor = layout.describe(topology)
         self._runtime = runtime
         self._store_submitted = False
