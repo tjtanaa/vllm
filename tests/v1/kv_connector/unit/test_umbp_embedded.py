@@ -337,6 +337,24 @@ def test_embedded_connector_rejects_pipeline_parallelism():
         )
 
 
+@pytest.mark.parametrize("role", [KVConnectorRole.SCHEDULER, KVConnectorRole.WORKER])
+@pytest.mark.parametrize("excluded_by", ["spec", "transfer"])
+def test_connector_rejects_eagle_draft_cache_omitted_from_prefix_restore(
+    role, excluded_by
+):
+    """Target-only restore must not silently leave draft KV uninitialized."""
+    from tests.v1.kv_connector.umbp_test_utils import minimax_m3_kv_cache_config
+
+    config = minimax_m3_kv_cache_config()
+    draft = config.kv_cache_groups[2]
+    if excluded_by == "spec":
+        draft.kv_cache_spec = SimpleNamespace(prefix_cacheable=False)
+    else:
+        draft.enable_kv_transfer = False
+    with pytest.raises(NotImplementedError, match="EAGLE draft cache group 2"):
+        UMBPStoreConnector(_vllm_config({"mode": "embedded"}), role, config)
+
+
 @pytest.mark.parametrize("close_rank", [None, 0, 1])
 def test_mori_scheduler_routes_lookup_and_clear_to_all_ranks(tmp_path, close_rank):
     _rank_namespace_from_key_prefix.cache_clear()

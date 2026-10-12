@@ -91,6 +91,16 @@ class UMBPStoreConnector(KVConnectorBase_V1, SupportsHMA):
             raise NotImplementedError(
                 "embedded UMBP does not support pipeline parallelism"
             )
+        # Prefix restore skips draft prefill, so draft KV cannot be omitted.
+        for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+            if (
+                group.is_eagle_group
+                and group_id not in kv_cache_config.prefix_cacheable_group_ids
+            ):
+                raise NotImplementedError(
+                    f"UMBP requires EAGLE draft cache group {group_id} to be "
+                    "prefix-cacheable and enabled for KV transfer"
+                )
         runtime = UMBPRuntimeFactory.build(runtime_config)
         if (
             runtime_config.options.get("enable_partial_hash_hits", False)

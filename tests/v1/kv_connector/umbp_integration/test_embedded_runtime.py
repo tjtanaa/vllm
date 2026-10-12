@@ -320,3 +320,72 @@ def test_finished_hybrid_tail_roundtrip_restores_full_state(tmp_path, device):
     finally:
         worker.close()
         scheduler.close()
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda:0"])
+def test_minimax_m3_fp8_target_indexer_and_eagle_pages_roundtrip(tmp_path, device):
+    """Restore each strided FP8 page without overwriting other groups or blocks."""
+    from tests.v1.kv_connector.umbp_test_utils import minimax_m3_kv_cache_config
+
+    config = minimax_m3_kv_cache_config()
+    runtime = MemoryRuntime()
+    if device != "cpu":
+        if not torch.accelerator.is_available():
+            pytest.skip("requires a ROCm GPU")
+        pytest.importorskip("mori.cpp")
+        torch.accelerator.set_device_index(0)
+        runtime = EmbeddedRuntime.from_config(
+            UMBPRuntimeConfig(
+                "embedded",
+                {"capacity_bytes": 16 << 20, "lookup_dir": str(tmp_path)},
+            )
+        )
+    planner = KVLayoutPlanner.from_kv_cache_config(config)
+    storage = torch.randint(
+        0,
+        256,
+        (config.kv_cache_tensors[0].size,),
+        device=device,
+        dtype=torch.uint8,
+        generator=torch.Generator(device=device).manual_seed(42),
+    )
+    caches = {
+        tensor.layers[0]: storage.as_strided(
+            (config.num_blocks, group.kv_cache_spec.page_size_bytes),
+            (tensor.block_stride, 1),
+            tensor.offset,
+        )
+        for tensor, group in zip(config.kv_cache_tensors, config.kv_cache_groups)
+    }
+    original = storage.clone()
+    planner.register_kv_caches(caches)
+    worker = runtime.create_worker_handle(
+        "minimax-strided", RankTopology(), planner.describe(RankTopology())
+    )
+    try:
+        worker.register_buffers(caches)
+        plans = [
+            planner.plan_registered_block(f"g{g}", g + 1, group_id=g) for g in range(3)
+        ]
+        stored = worker.wait(worker.store(plans))
+        assert stored.status is TransferJobStatus.COMPLETED
+        worker.publish(stored)
+        storage.fill_(0xA5)
+        expected = storage.clone()
+        for g, (name, cache) in enumerate(caches.items()):
+            expected.as_strided(cache.shape, cache.stride(), cache.storage_offset())[
+                g + 4
+            ].copy_(
+                original.as_strided(
+                    cache.shape, cache.stride(), cache.storage_offset()
+                )[g + 1]
+            )
+        loads = [
+            planner.plan_registered_block(f"g{g}", g + 4, group_id=g) for g in range(3)
+        ]
+        assert worker.wait(worker.load(loads)).status is TransferJobStatus.COMPLETED
+        if device != "cpu":
+            torch.accelerator.synchronize()
+        assert torch.equal(storage, expected)
+    finally:
+        worker.close()

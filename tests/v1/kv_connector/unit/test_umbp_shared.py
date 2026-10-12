@@ -3164,3 +3164,54 @@ def test_restored_hybrid_store_residency_skips_live_state_groups():
     tracker = RequestTracker(generation=0)
     tracker.load_spec = LoadSpec(local_tokens=0, external_tokens=16)
     assert scheduler._store_plans(request, tracker, 16, ([0], [7])) == []
+
+
+@pytest.mark.parametrize(
+    ("missing_group", "missing_rank"),
+    [(None, 0), *((group, rank) for group in range(3) for rank in range(4))],
+)
+def test_minimax_m3_eagle_lookup_requires_every_cache_on_every_rank(
+    missing_group, missing_rank
+):
+    """Target K/V alone cannot restore a sparse indexer or EAGLE3 prefix."""
+    from tests.v1.kv_connector.umbp_test_utils import minimax_m3_kv_cache_config
+
+    config = minimax_m3_kv_cache_config()
+    topology = RankTopology(tp_size=4)
+    codec = BlockIdentityCodec(UMBPNamespace("minimax-m3-eagle"))
+    hashes = [b"a", b"b", b"c", b"d"]
+    hits = dict.fromkeys(
+        [
+            key
+            for h in hashes
+            for key in codec.keys_for_topology(h, topology, (0, 1, 2))
+        ],
+        True,
+    )
+    if missing_group is not None:
+        hits[codec.key_for_namespace(b"a", missing_group, (missing_rank, 0, 0, 0))] = (
+            False
+        )
+    vllm_config = _vllm_config(
+        {"mode": "embedded", "load_async": False},
+        tensor_parallel_size=4,
+        world_size=4,
+    )
+    vllm_config.cache_config.block_size = 128
+    vllm_config.model_config.max_model_len = 1024
+    vllm_config.speculative_config = SimpleNamespace(use_eagle_block_drop=lambda: True)
+    scheduler = UMBPStoreConnectorScheduler(
+        vllm_config,
+        config,
+        _SchedulerHandle(hits),
+        codec,
+        topology,
+    )
+    try:
+        result = scheduler.get_num_new_matched_tokens(
+            SimpleNamespace(request_id="r", block_hashes=hashes, num_tokens=513),
+            0,
+        )
+        assert result == ((384, True) if missing_group is None else (0, False))
+    finally:
+        scheduler.close()
