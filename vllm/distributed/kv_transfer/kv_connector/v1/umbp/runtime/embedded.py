@@ -792,6 +792,7 @@ _DISTRIBUTED_ONLY_OPTIONS = frozenset(
         "backend_policy_path",
         "lookup_timeout_ms",
         "ranged_scratch_size",
+        "rdma_devices",
     }
 )
 

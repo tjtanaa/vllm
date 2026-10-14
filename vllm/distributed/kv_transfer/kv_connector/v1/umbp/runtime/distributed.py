@@ -105,6 +105,16 @@ def _resolve_distributed_options(config: UMBPRuntimeConfig) -> dict[str, Any]:
     for name in ("cache_remote_fetches", "ranged_locality_prefetch", "local_first"):
         if name in options and type(options[name]) is not bool:
             raise ValueError(f"{name} must be a boolean")
+    devices = options.get("rdma_devices")
+    if devices is not None and (
+        not isinstance(devices, list)
+        or not devices
+        or not all(isinstance(d, str) and d for d in devices)
+    ):
+        raise ValueError(
+            "rdma_devices must be a non-empty list of MORI_RDMA_DEVICES values "
+            "indexed by physical GPU"
+        )
     local = sorted(_LOCAL_ONLY_OPTIONS.intersection(options))
     if local:
         raise ValueError(
@@ -362,7 +372,7 @@ class DistributedRuntime(IUMBPRuntime):
         if object_size:
             _warn_on_page_padding(object_size, options)
         capacity = options.get("capacity_bytes", 64 * 1024**3)
-        if capacity > _LARGE_4K_POOL_BYTES and not options.get("dram_use_hugepages"):
+        if capacity >= _LARGE_4K_POOL_BYTES and not options.get("dram_use_hugepages"):
             logger.warning(
                 "UMBP distributed pool of %.1f GiB uses 4 KiB pages. NICs with a "
                 "small translation cache (e.g. AMD Pollara) cannot register that "
@@ -383,6 +393,17 @@ class DistributedRuntime(IUMBPRuntime):
                 f"UMBP port base plus physical GPU {device} exceeds 65535; lower "
                 "peer_service_port or io_engine_port"
             )
+        devices = options.get("rdma_devices")
+        if devices is not None:
+            if device >= len(devices):
+                raise ValueError(
+                    f"rdma_devices lists {len(devices)} entries but this worker "
+                    f"runs on physical GPU {device}"
+                )
+            # MORI reads MORI_RDMA_DEVICES once, when this worker's client
+            # opens its RDMA context below. Host-memory transfers otherwise
+            # start on the first visible NIC in every process.
+            os.environ["MORI_RDMA_DEVICES"] = devices[device]
         node_id = _node_id(self._prefix, f"gpu{device}")
         try:
             client = _build_client(
@@ -400,12 +421,13 @@ class DistributedRuntime(IUMBPRuntime):
             ) from exc
         logger.info(
             "UMBP distributed worker %s joined master %s: %.2f GiB pool, "
-            "peer service port %d, tp_rank %d",
+            "peer service port %d, tp_rank %d, RDMA devices %s",
             node_id,
             self._master,
             options.get("capacity_bytes", 64 * 1024**3) / 1024**3,
             peer_port,
             topology.tp_rank,
+            os.environ.get("MORI_RDMA_DEVICES", "all"),
         )
         return _DistributedWorkerHandle(
             client,

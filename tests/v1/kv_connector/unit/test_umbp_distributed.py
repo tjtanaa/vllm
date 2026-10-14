@@ -3,6 +3,7 @@
 
 import ctypes
 import enum
+import os
 import sys
 import threading
 import time
@@ -294,6 +295,9 @@ def _layout(object_size: int) -> KVLayoutDescriptor:
         ({**BASE_OPTIONS, "dram_high_watermark": 0.9}, "master decides eviction"),
         ({**BASE_OPTIONS, "dram_use_shared_memory": True}, "does not use"),
         ({**BASE_OPTIONS, "dram_prefault": "no"}, "dram_prefault"),
+        ({**BASE_OPTIONS, "rdma_devices": "ionic_0"}, "rdma_devices"),
+        ({**BASE_OPTIONS, "rdma_devices": []}, "rdma_devices"),
+        ({**BASE_OPTIONS, "rdma_devices": ["ionic_0", ""]}, "rdma_devices"),
     ],
 )
 def test_config_rejects_invalid_distributed_options(options, match):
@@ -302,7 +306,9 @@ def test_config_rejects_invalid_distributed_options(options, match):
 
 
 @pytest.mark.parametrize("mode", ["embedded", "standalone"])
-@pytest.mark.parametrize("option", ["peer_service_port", "dram_page_size", "node_id"])
+@pytest.mark.parametrize(
+    "option", ["peer_service_port", "dram_page_size", "node_id", "rdma_devices"]
+)
 def test_local_modes_reject_distributed_only_options(mode, option):
     extra = {"mode": mode, option: 1}
     if mode == "standalone":
@@ -368,6 +374,30 @@ def test_worker_binds_ports_offset_by_its_physical_gpu(master, monkeypatch):
     assert "-gpu3-" in dist.master_config.node_id
 
 
+def test_worker_selects_the_rdma_devices_listed_for_its_physical_gpu(
+    master, monkeypatch
+):
+    monkeypatch.setenv("MORI_RDMA_DEVICES", "ionic_0")
+    monkeypatch.setattr(distributed_runtime, "_physical_device_index", lambda: 2)
+    devices = ["ionic_0", "ionic_1", "ionic_2", "ionic_3"]
+    runtime = _dist(dict(BASE_OPTIONS, node_address="10.0.0.2", rdma_devices=devices))
+    runtime.create_worker_handle("ns", RankTopology(), None)
+
+    assert os.environ["MORI_RDMA_DEVICES"] == "ionic_2"
+
+
+def test_worker_rejects_a_gpu_beyond_rdma_devices(master, monkeypatch):
+    monkeypatch.setenv("MORI_RDMA_DEVICES", "ionic_0")
+    monkeypatch.setattr(distributed_runtime, "_physical_device_index", lambda: 4)
+    runtime = _dist(
+        dict(BASE_OPTIONS, node_address="10.0.0.2", rdma_devices=["ionic_0"] * 4)
+    )
+    with pytest.raises(ValueError, match="physical GPU 4"):
+        runtime.create_worker_handle("ns", RankTopology(), None)
+    assert master.clients == []
+    assert os.environ["MORI_RDMA_DEVICES"] == "ionic_0"
+
+
 def test_worker_defaults_to_this_host_address_and_a_free_io_port(master, monkeypatch):
     import vllm.utils.network_utils as network_utils
 
@@ -402,6 +432,7 @@ def test_scratch_smaller_than_one_object_fails_at_startup(master):
         ({"capacity_bytes": 1 << 20}, 3 << 20, ["padding"]),
         ({"capacity_bytes": 1 << 20, "dram_page_size": 1 << 20}, 3 << 20, []),
         ({"capacity_bytes": 4 << 30}, 2 << 20, ["hugepages"]),
+        ({"capacity_bytes": 512 << 20}, 2 << 20, ["hugepages"]),
         ({"capacity_bytes": 4 << 30, "dram_use_hugepages": True}, 2 << 20, []),
     ],
 )
