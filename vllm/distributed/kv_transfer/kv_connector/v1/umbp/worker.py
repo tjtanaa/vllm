@@ -52,6 +52,7 @@ class UMBPStoreConnectorWorker:
         layerwise_load: bool = True,
         layerwise_store: bool = False,
         enable_kv_cache_events: bool = False,
+        report_failed_requests: bool = False,
     ) -> None:
         self.runtime = runtime
         self.layout = layout
@@ -59,6 +60,7 @@ class UMBPStoreConnectorWorker:
         self.layerwise_load = layerwise_load
         self.layerwise_store = layerwise_store
         self.enable_kv_cache_events = enable_kv_cache_events
+        self._report_failed_requests = report_failed_requests
         self._load_jobs: dict[str, dict[str | None, TransferJobState]] = {}
         self._store_jobs: dict[str, TransferJobState] = {}
         self._pending_stores: list[_StoreBatch] = []
@@ -223,7 +225,8 @@ class UMBPStoreConnectorWorker:
                 self._failed_recving.add(request_id)
                 for key in result.failed_keys:
                     self._worker_meta.failed_loads[key] = result.error or "load failed"
-            self._worker_meta.failed_block_ids.update(result.failed_block_ids)
+            if not self._report_failed_requests:
+                self._worker_meta.failed_block_ids.update(result.failed_block_ids)
         elif succeeded:
             if publish:
                 self.runtime.publish(result)
