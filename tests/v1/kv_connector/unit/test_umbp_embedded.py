@@ -941,7 +941,7 @@ def test_async_transfer_timeout_does_not_release_buffers():
     job.start()
     future: Future[TransferJobState] = Future()
     handle._futures[id(job)] = future
-    handle._transfer_deadlines[id(job)] = 0
+    handle._store_deadlines[id(job)] = 0
     with pytest.raises(TimeoutError, match="buffers still in use"):
         handle.poll(job)
     assert job.status is TransferJobStatus.RUNNING
@@ -993,8 +993,8 @@ def test_async_load_timeout_retains_worker_job_and_registered_buffers(
     )
     assert started.wait(5)
     job = worker._load_jobs["r"][None]
-    assert id(job) in handle._transfer_deadlines
-    handle._transfer_deadlines[id(job)] = 0
+    assert id(job) in handle._load_deadlines
+    handle._load_deadlines[id(job)] = 0
 
     def close():
         close_started.set()

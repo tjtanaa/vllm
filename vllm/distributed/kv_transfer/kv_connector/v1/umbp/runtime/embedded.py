@@ -330,7 +330,10 @@ class _MoriWorkerHandle(UMBPWorkerHandle):
             thread_name_prefix="umbp-embedded-transfer",
         )
         self._futures: dict[int, Future[TransferJobState]] = {}
-        self._transfer_deadlines: dict[int, float] = {}
+        # Kept apart because shared-pool handles treat an overdue store
+        # (still reading pinned blocks) differently from an overdue load.
+        self._store_deadlines: dict[int, float] = {}
+        self._load_deadlines: dict[int, float] = {}
         self._timeout_s = timeout_s
         self._store_retry_count = 2
         self._store_retry_backoff_s = 0.01
@@ -522,7 +525,7 @@ class _MoriWorkerHandle(UMBPWorkerHandle):
     ) -> TransferJobState:
         job = TransferJobState(plans, plan_bytes=plan_bytes)
         job.start()
-        self._transfer_deadlines[id(job)] = time.monotonic() + self._timeout_s
+        self._load_deadlines[id(job)] = time.monotonic() + self._timeout_s
         self._futures[id(job)] = self._executor.submit(
             self._load_sync, job, plans, range_args
         )
@@ -600,7 +603,7 @@ class _MoriWorkerHandle(UMBPWorkerHandle):
                 event = torch.Event()
                 event.record(torch.accelerator.current_stream())
                 ready_events.append(event)
-        self._transfer_deadlines[id(job)] = time.monotonic() + self._timeout_s
+        self._store_deadlines[id(job)] = time.monotonic() + self._timeout_s
         self._futures[id(job)] = self._executor.submit(
             self._store_sync, job, plans, ready_events, range_args
         )
@@ -681,7 +684,11 @@ class _MoriWorkerHandle(UMBPWorkerHandle):
         finally:
             if future.done():
                 self._futures.pop(id(job), None)
-                self._transfer_deadlines.pop(id(job), None)
+                self._forget_deadline(id(job))
+
+    def _forget_deadline(self, job_id: int) -> None:
+        self._store_deadlines.pop(job_id, None)
+        self._load_deadlines.pop(job_id, None)
 
     def poll(self, job: TransferJobState) -> TransferJobState | None:
         future = self._futures.get(id(job))
@@ -697,14 +704,16 @@ class _MoriWorkerHandle(UMBPWorkerHandle):
             # A running native transfer cannot be safely cancelled. Fail the
             # engine step without completing the job or releasing ownership;
             # close() still joins I/O before deregistering its GPU buffers.
-            deadline = self._transfer_deadlines.get(id(job))
+            deadline = self._store_deadlines.get(
+                id(job), self._load_deadlines.get(id(job))
+            )
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(
                     "MORI UMBP transfer timed out with buffers still in use"
                 )
             return None
         self._futures.pop(id(job), None)
-        self._transfer_deadlines.pop(id(job), None)
+        self._forget_deadline(id(job))
         try:
             return future.result()
         except Exception as exc:
@@ -723,7 +732,7 @@ class _MoriWorkerHandle(UMBPWorkerHandle):
             return job
         if future.cancel():
             self._futures.pop(id(job), None)
-            self._transfer_deadlines.pop(id(job), None)
+            self._forget_deadline(id(job))
             job.cancel("preempted")
             return job
         return self.wait(job)
