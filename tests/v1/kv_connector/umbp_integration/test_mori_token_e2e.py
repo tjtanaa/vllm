@@ -2,8 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Token-level correctness tests for the MORI-backed UMBP runtime."""
 
+import contextlib
 import json
 import os
+import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -79,10 +82,55 @@ def test_mori_external_kv_preserves_generated_tokens(tmp_path):
     "VLLM_UMBP_HYBRID_TEST_MODEL" not in os.environ,
     reason="set VLLM_UMBP_HYBRID_TEST_MODEL to a local hybrid model",
 )
+@contextlib.contextmanager
+def _standalone_server(tmp_path: Path, capacity_bytes: int):
+    """Run a node-local umbp_standalone_server for the test's engine."""
+    import mori
+
+    binary = shutil.which("umbp_standalone_server") or str(
+        Path(mori.__file__).parent / "umbp_standalone_server"
+    )
+    if not Path(binary).exists():
+        pytest.skip("umbp_standalone_server is not installed")
+    socket = tmp_path / "umbp.grpc.sock"
+    env = dict(
+        os.environ,
+        UMBP_STANDALONE_ADDRESS=f"unix://{socket}",
+        UMBP_DRAM_CAPACITY=str(capacity_bytes),
+    )
+    with open(tmp_path / "server.log", "w") as log:
+        process = subprocess.Popen(
+            [binary], env=env, stdout=log, stderr=subprocess.STDOUT
+        )
+        try:
+            yield str(socket)
+        finally:
+            process.terminate()
+            try:
+                process.wait(10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+
+
 @pytest.mark.parametrize("lazy", [False, True], ids=["eager", "lazy"])
-def test_mori_hybrid_restore_after_gpu_reset(tmp_path, lazy):
+@pytest.mark.parametrize("mode", ["embedded", "standalone"])
+def test_mori_hybrid_restore_after_gpu_reset(tmp_path, lazy, mode):
     """Real weights, fresh GPU cache, multi-token output and external-load proof."""
     options = json.loads(os.environ.get("VLLM_UMBP_HYBRID_TEST_ARGS", "{}"))
+    with contextlib.ExitStack() as stack:
+        if mode == "embedded":
+            pool = {"capacity_bytes": 4 << 30, "lookup_dir": str(tmp_path)}
+        else:
+            # One server pool serves every TP rank; match the embedded total so
+            # the cache-flush filler prompts do not evict the restored prefix.
+            ranks = options.get("tensor_parallel_size", 1)
+            server = _standalone_server(tmp_path, ranks * (4 << 30))
+            endpoint = stack.enter_context(server)
+            pool = {"endpoint": endpoint}
+        _run_hybrid_restore(tmp_path, lazy, mode, pool, options)
+
+
+def _run_hybrid_restore(tmp_path, lazy, mode, pool, options):
     llm = LLM(
         model=os.environ["VLLM_UMBP_HYBRID_TEST_MODEL"],
         enforce_eager=True,
@@ -96,9 +144,8 @@ def test_mori_hybrid_restore_after_gpu_reset(tmp_path, lazy):
             kv_connector="UMBPStoreConnector",
             kv_role="kv_both",
             kv_connector_extra_config={
-                "mode": "embedded",
-                "capacity_bytes": 4 << 30,
-                "lookup_dir": str(tmp_path),
+                "mode": mode,
+                **pool,
                 "timeout_ms": 60000,
                 "load_async": False,
                 "lazy_offload": lazy,
@@ -296,7 +343,7 @@ def test_mori_hybrid_restore_after_gpu_reset(tmp_path, lazy):
     finally:
         destination = Path(os.environ.get("VLLM_UMBP_EVIDENCE_DIR", str(tmp_path)))
         destination.mkdir(parents=True, exist_ok=True)
-        (destination / f"hybrid-{'lazy' if lazy else 'eager'}.json").write_text(
+        (destination / f"hybrid-{mode}-{'lazy' if lazy else 'eager'}.json").write_text(
             json.dumps(report, indent=2) + "\n"
         )
         llm.llm_engine.engine_core.shutdown()

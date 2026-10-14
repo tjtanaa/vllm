@@ -79,6 +79,19 @@ same layout share objects. Engines with a different layout use different keys
 and cannot read each other's objects. `key_namespace` overrides the derived
 namespace; use it to separate weight versions that share a model path.
 
+## Hybrid models
+
+Hybrid-cache models such as Qwen3.8 Flash Next (Gated DeltaNet, QSA
+compressed attention and recurrent state) restore through the server the same
+way as in embedded mode: every prefix-cacheable cache group must restore
+together at a complete block boundary, and loads are asynchronous.
+
+One server pool serves every TP rank on the host, whereas an embedded
+`capacity_bytes` is per worker. Size `UMBP_DRAM_CAPACITY` for the combined
+working set of all ranks and engines: a pool sized like one embedded worker
+evicts a TP4 engine's prefixes before they can be restored, and requests
+recompute instead.
+
 ## Failure behavior
 
 | Event | Behavior |
