@@ -10,25 +10,34 @@ cache-group kind and the MoE is cut to a handful of experts. Dummy weights are
 seeded, so the prefill, decode and reference servers hold identical weights.
 
 Prefill runs on one GPU, decode on another, and MoRI moves the KV over xGMI.
-A case passes when the decode server's first-token log-probabilities, computed
-from the transferred cache, match a direct (non-disaggregated) serve of the
-same prompt, and the decode server reports external prefix-cache hits (so the
-match is not a full local recompute). Two guards keep the comparison honest:
+Prefill computes the first ``n - 1`` prompt tokens and decode computes the last
+one from the transferred KV and recurrent state. A direct serve splits the same
+prompt the same way when the first ``n - 1`` tokens end on a chunk boundary
+that both servers share, so the prompts are chosen to make that happen: one is
+a single chunk plus one token, the others are a whole number of hybrid cache
+blocks plus one token (prefix caching ends chunks on block boundaries). With
+the split matched, a correct transfer reproduces the direct serve's first-token
+log-probabilities exactly, so the comparison needs no noise allowance. Guards:
 
-* the reference must move by more than ``SENSITIVITY_FACTOR * TOLERANCE`` when
-  the early context changes, so wrong KV would be visible at all;
+* decode must report an external prefix-cache hit for every token but the last
+  of every prompt, so the match is not a local recompute;
+* changing the first half of a prompt must move the direct serve's log-probs by
+  at least ``MIN_CONTEXT_EFFECT``, so a wrong prefix would be visible;
 * ``test_corrupted_prefill_state_is_detected`` makes prefill compute its KV with
-  a different norm epsilon (same shapes, different values) and requires the
-  comparison to fail.
+  a different norm epsilon (same shapes, different values) and requires every
+  prompt to fail the comparison.
 """
 
+import atexit
 import contextlib
 import json
 import os
 import random
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -52,16 +61,27 @@ _PROXY = (
 _PROXY_PING_PORT = 36367
 
 # Max allowed difference between centered first-token log-probabilities of the
-# P/D and reference outputs, over the reference's top-k tokens.
-TOLERANCE = float(os.getenv("MORIIO_DUMMY_E2E_TOL", "0.02"))
-SENSITIVITY_FACTOR = 5.0
+# P/D and direct outputs, over the direct serve's top-k tokens. The split is
+# matched, so correct transfers produce identical logits; this only absorbs the
+# fp32 rounding of the log-softmax (~1e-7), far below one bf16 logit step.
+TOLERANCE = float(os.getenv("MORIIO_DUMMY_E2E_TOL", "1e-5"))
+# Several bf16 steps of the logits at DUMMY_WEIGHT_RANGE.
+MIN_CONTEXT_EFFECT = 0.05
+# Half-width of the uniform dummy init. The loader default (1e-3) shrinks every
+# activation so far that a context change moves the first-token log-probs by
+# ~1e-4; at 0.1 it moves them by >0.1 and a corrupted prefill changes the top-k
+# set entirely.
+DUMMY_WEIGHT_RANGE = 0.1
 TOP_K = 20
 MAX_TOKENS = 4
+MAX_MODEL_LEN = 4096
 
-# Shorter than one block, a few blocks, and longer than the prefill token
-# budget so the request is split into chunks and the final-chunk save path runs.
-PROMPT_LENGTHS = (7, 300, 1500, 3000)
-MAX_NUM_BATCHED_TOKENS = 1024
+# Prefill token budget of every server. Prompts longer than it are chunked, so
+# the final-chunk save path runs; the short prompt fills exactly one chunk.
+PREFILL_CHUNK = 299
+SHORT_PROMPT_LEN = PREFILL_CHUNK + 1
+# Hybrid blocks per aligned prompt, before the trailing token.
+ALIGNED_BLOCKS = (1, 2)
 
 
 def _mori_available() -> bool:
@@ -194,7 +214,9 @@ CASES = [
     Case("qwen3_5_moe", "TRITON_ATTN", "NONE", "NONE"),
     Case("qwen3_5_moe", "TRITON_ATTN", "PIECEWISE", "PIECEWISE"),
     Case("qwen3_5_moe", "TRITON_ATTN", _DEFAULT, "FULL_DECODE_ONLY"),
-    Case("qwen3_5_moe", "ROCM_ATTN", _DEFAULT, _DEFAULT),
+    # ROCM_ATTN keeps a (2, num_blocks, ...) KV layout and opts out of KV
+    # connectors, so the second ROCm attention backend is the unified one.
+    Case("qwen3_5_moe", "ROCM_AITER_UNIFIED_ATTN", _DEFAULT, _DEFAULT),
 ]
 
 
@@ -216,6 +238,26 @@ def _visible_devices() -> tuple[str, list[str]]:
     return selector, devices
 
 
+def _device_env(selector: str, device: str) -> dict[str, str]:
+    # vLLM mirrors HIP_VISIBLE_DEVICES into CUDA_VISIBLE_DEVICES at import, so
+    # the test process carries both; pin every selector or the server refuses
+    # the mismatch. ROCR narrows the set first, so HIP/CUDA then index into it.
+    env = {selector: device}
+    for key in ("HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
+        if key != selector:
+            env[key] = "0" if selector == "ROCR_VISIBLE_DEVICES" else device
+    return env
+
+
+# KV consumers force enable_mm_embeds on, which moves multimodal-capable models
+# (Qwen3.5) from input_ids to inputs_embeds, but the AOT compile-cache key does
+# not cover it, so a consumer can load a producer's graph and crash in
+# profile_run. Keep each role's compile cache apart until
+# vllm-project/vllm#54642 lands (vllm-project/vllm#50891).
+_CACHE_ROOT = Path(tempfile.mkdtemp(prefix="moriio_dummy_e2e_cache_"))
+atexit.register(shutil.rmtree, _CACHE_ROOT, ignore_errors=True)
+
+
 def _server(
     arch: ArchCase,
     overrides: dict[str, Any],
@@ -234,6 +276,8 @@ def _server(
         str(port),
         "--load-format",
         "dummy",
+        "--model-loader-extra-config",
+        json.dumps({"dummy_weight_range": DUMMY_WEIGHT_RANGE}),
         "--hf-overrides",
         json.dumps(overrides),
         "--dtype",
@@ -241,9 +285,9 @@ def _server(
         "--attention-backend",
         backend,
         "--max-model-len",
-        "4096",
+        str(MAX_MODEL_LEN),
         "--max-num-batched-tokens",
-        str(MAX_NUM_BATCHED_TOKENS),
+        str(PREFILL_CHUNK),
         "--max-num-seqs",
         "16",
         "--kv-cache-memory-bytes",
@@ -253,15 +297,18 @@ def _server(
         "--enable-prefix-caching",
         *_graph_args(graph),
     ]
+    role = "direct"
     if kv_transfer_config is not None:
         args += ["--kv-transfer-config", json.dumps(kv_transfer_config)]
+        role = kv_transfer_config["kv_role"]
     env = {
         "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"],
-        selector: device,
+        **_device_env(selector, device),
         "VLLM_HOST_IP": "127.0.0.1",
         "VLLM_PORT": str(get_open_port()),
         "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
         "VLLM_SSM_CONV_STATE_LAYOUT": "DS",
+        "VLLM_CACHE_ROOT": str(_CACHE_ROOT / role),
         **arch.env,
     }
     return RemoteOpenAIServer(
@@ -362,13 +409,20 @@ def _pd_pair(
 def _wait_for_registration(proxy_url: str, model: str) -> None:
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline:
-        response = requests.post(
-            f"{proxy_url}/v1/completions",
-            json={"model": model, "prompt": [1000, 1001], "max_tokens": 1},
-            timeout=300,
-        )
-        if response.status_code == 200:
-            return
+        # The proxy hands decode max_tokens - 1 (prefill emits the first
+        # token), so the probe needs at least 2 for decode to accept it.
+        try:
+            response = requests.post(
+                f"{proxy_url}/v1/completions",
+                json={"model": model, "prompt": [1000, 1001], "max_tokens": 2},
+                timeout=300,
+            )
+            # The proxy streams the decode body, so a decode-side error can
+            # surface as a truncated response rather than a status code.
+            if response.status_code == 200 and response.json()["choices"]:
+                return
+        except requests.RequestException:
+            pass
         time.sleep(1)
     raise TimeoutError("prefill/decode never registered with the MoRIIO proxy")
 
@@ -377,9 +431,43 @@ def _wait_for_registration(proxy_url: str, model: str) -> None:
 # Measurement
 
 
-def _prompts(seed: int = 0) -> list[list[int]]:
-    rng = random.Random(seed)
-    return [[rng.randrange(1000, 30000) for _ in range(n)] for n in PROMPT_LENGTHS]
+def _metric(server: RemoteOpenAIServer, name: str) -> list[Any]:
+    from prometheus_client.parser import text_string_to_metric_families
+
+    response = requests.get(server.url_for("metrics"), timeout=10)
+    response.raise_for_status()
+    return [
+        sample
+        for family in text_string_to_metric_families(response.text)
+        for sample in family.samples
+        if sample.name == name
+    ]
+
+
+def _block_size(server: RemoteOpenAIServer) -> int:
+    # Hybrid models pad the attention block to the recurrent-state page, so the
+    # effective size is only known once the server has started.
+    sizes = {
+        int(sample.labels["block_size"])
+        for sample in _metric(server, "vllm:cache_config_info")
+    }
+    assert len(sizes) == 1, f"expected one cache block size, got {sizes}"
+    return sizes.pop()
+
+
+def _prompt_lengths(block_size: int) -> list[int]:
+    aligned = [
+        k * block_size + 1
+        for k in ALIGNED_BLOCKS
+        if k * block_size + 1 + MAX_TOKENS <= MAX_MODEL_LEN
+    ]
+    assert aligned, f"block size {block_size} leaves no aligned prompt"
+    return [SHORT_PROMPT_LEN, *aligned]
+
+
+def _prompts(lengths: list[int]) -> list[list[int]]:
+    rng = random.Random(0)
+    return [[rng.randrange(1000, 30000) for _ in range(n)] for n in lengths]
 
 
 def _first_step(url: str, model: str, prompt: list[int]) -> dict[str, float]:
@@ -404,8 +492,8 @@ def _first_step(url: str, model: str, prompt: list[int]) -> dict[str, float]:
 def _distance(ref: dict[str, float], got: dict[str, float]) -> float:
     """Max difference of centered log-probs over the shared top-k tokens.
 
-    Centering removes the log-sum-exp offset, which differs slightly between
-    servers, leaving the logit differences the KV actually determines.
+    Centering removes the log-sum-exp offset, leaving the logit differences the
+    KV actually determines.
     """
     common = sorted(ref.keys() & got.keys())
     if len(common) < len(ref) // 2:
@@ -416,46 +504,53 @@ def _distance(ref: dict[str, float], got: dict[str, float]) -> float:
 
 
 def _external_hits(server: RemoteOpenAIServer) -> float:
-    from prometheus_client.parser import text_string_to_metric_families
-
-    response = requests.get(server.url_for("metrics"), timeout=10)
-    response.raise_for_status()
-    return sum(
-        sample.value
-        for family in text_string_to_metric_families(response.text)
-        for sample in family.samples
-        if sample.name == "vllm:external_prefix_cache_hits_total"
-    )
+    samples = _metric(server, "vllm:external_prefix_cache_hits_total")
+    return sum(sample.value for sample in samples)
 
 
-def _reference(
-    arch: ArchCase, overrides: dict[str, Any], case: Case
-) -> list[dict[str, float]]:
-    """Direct serve on the decode settings; also checks the metric is useful."""
+@dataclass
+class Reference:
+    prompts: list[list[int]]
+    logprobs: list[dict[str, float]]
+
+    @property
+    def expected_external_hits(self) -> int:
+        return sum(len(p) - 1 for p in self.prompts)
+
+
+def _reference(arch: ArchCase, overrides: dict[str, Any], case: Case) -> Reference:
+    """Direct serve; also checks that the comparison can see a wrong prefix."""
     selector, devices = _visible_devices()
-    prompts = _prompts()
+    # Prefill graphs run the chunks and the decode-only last step runs the same
+    # captured graph in every decode mode used here, so the prefill mode
+    # reproduces both halves of the P/D computation.
     with _server(
-        arch, overrides, case.attention_backend, case.decode_graph, devices[0], selector
+        arch,
+        overrides,
+        case.attention_backend,
+        case.prefill_graph,
+        devices[0],
+        selector,
     ) as server:
         url = server.url_root
+        lengths = _prompt_lengths(_block_size(server))
+        prompts = _prompts(lengths)
         refs = [_first_step(url, arch.model, p) for p in prompts]
         # Same tail, different early context: the comparison has to see it.
         for prompt, ref in zip(prompts, refs):
-            if len(prompt) < 2:
-                continue
             altered = [t + 1 for t in prompt[: len(prompt) // 2]]
             altered += prompt[len(prompt) // 2 :]
             moved = _distance(ref, _first_step(url, arch.model, altered))
             print(f"[sensitivity] len={len(prompt)} context-change distance={moved}")
-            assert moved > SENSITIVITY_FACTOR * TOLERANCE, (
-                f"first-token log-probs barely depend on the context "
-                f"(moved {moved:.4g} for len {len(prompt)}); dummy weights are "
-                f"too weak to detect wrong KV at tolerance {TOLERANCE}"
+            assert moved >= MIN_CONTEXT_EFFECT, (
+                f"first-token log-probs barely depend on the context (moved "
+                f"{moved:.4g} for len {len(prompt)}); a wrong prefix would go "
+                "unnoticed"
             )
-        # Determinism of the reference itself.
+        # Determinism of the reference itself (served from its prefix cache).
         again = _first_step(url, arch.model, prompts[-1])
         print(f"[noise] repeat distance={_distance(refs[-1], again)}")
-    return refs
+    return Reference(prompts, refs)
 
 
 def _pd_distances(
@@ -463,20 +558,20 @@ def _pd_distances(
     prefill_overrides: dict[str, Any],
     decode_overrides: dict[str, Any],
     case: Case,
-    refs: list[dict[str, float]],
+    ref: Reference,
 ) -> tuple[list[float], float]:
-    prompts = _prompts()
     with _pd_pair(arch, prefill_overrides, decode_overrides, case) as (
         proxy_url,
         decode,
     ):
         hits_before = _external_hits(decode)
         distances = [
-            _distance(ref, _first_step(proxy_url, arch.model, prompt))
-            for prompt, ref in zip(prompts, refs)
+            _distance(expected, _first_step(proxy_url, arch.model, prompt))
+            for prompt, expected in zip(ref.prompts, ref.logprobs)
         ]
         hits = _external_hits(decode) - hits_before
-    print(f"[pd] {case.id} distances={distances} external_hits={hits}")
+    lengths = [len(p) for p in ref.prompts]
+    print(f"[pd] {case.id} lens={lengths} distances={distances} external_hits={hits}")
     return distances, hits
 
 
@@ -488,15 +583,16 @@ def _pd_distances(
 def test_write_matches_direct_serve(case: Case):
     arch = ARCHS[case.arch]
     overrides = _arch_overrides(arch)
-    refs = _reference(arch, overrides, case)
-    distances, hits = _pd_distances(arch, overrides, overrides, case, refs)
+    ref = _reference(arch, overrides, case)
+    distances, hits = _pd_distances(arch, overrides, overrides, case, ref)
 
-    # Every token but the last of every prompt should come from prefill.
-    assert hits >= 0.5 * sum(n - 1 for n in PROMPT_LENGTHS), (
-        f"decode reported only {hits} external prefix-cache hits; "
-        "it recomputed the prompts instead of using the transferred KV"
+    # Every token but the last of every prompt must come from prefill.
+    assert hits == ref.expected_external_hits, (
+        f"decode reported {hits} external prefix-cache hits, expected "
+        f"{ref.expected_external_hits}; it did not use all the transferred KV"
     )
-    bad = {n: d for n, d in zip(PROMPT_LENGTHS, distances) if not d <= TOLERANCE}
+    lengths = [len(p) for p in ref.prompts]
+    bad = {n: d for n, d in zip(lengths, distances) if not d <= TOLERANCE}
     assert not bad, f"P/D first-token log-probs differ from direct serve: {bad}"
 
 
@@ -507,12 +603,14 @@ def test_corrupted_prefill_state_is_detected(arch_name: str):
     default = next(c for c in CASES if c.arch == arch_name)
     case = Case(arch_name, default.attention_backend, _DEFAULT, _DEFAULT)
     overrides = _arch_overrides(arch)
-    refs = _reference(arch, overrides, case)
+    ref = _reference(arch, overrides, case)
     corrupted = _merge(overrides, arch.corrupt_overrides)
-    distances, hits = _pd_distances(arch, corrupted, overrides, case, refs)
+    distances, hits = _pd_distances(arch, corrupted, overrides, case, ref)
 
-    assert hits > 0, "decode never used transferred KV; the control proves nothing"
-    assert max(distances) > TOLERANCE, (
+    assert hits == ref.expected_external_hits, (
+        "decode did not use the transferred KV; the control proves nothing"
+    )
+    assert all(d > TOLERANCE for d in distances), (
         f"P/D outputs with wrongly computed prefill KV still matched the "
         f"reference (distances {distances}); the comparison cannot detect "
         "transfer corruption"
