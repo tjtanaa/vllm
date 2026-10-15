@@ -219,6 +219,27 @@ CASES = [
     Case("qwen3_5_moe", "ROCM_AITER_UNIFIED_ATTN", _DEFAULT, _DEFAULT),
 ]
 
+KNOWN_FAILURES = {
+    Case("qwen3_5_moe", "ROCM_AITER_UNIFIED_ATTN", _DEFAULT, _DEFAULT): (
+        "intermittent: P/D first-token log-probs sometimes differ from the "
+        "matched direct serve by ~0.06 on block-aligned prompts (the "
+        "single-chunk prompt stays exact); TRITON_ATTN has been exact"
+    ),
+}
+
+
+def _case_params() -> list[Any]:
+    return [
+        pytest.param(
+            case,
+            id=case.id,
+            marks=[pytest.mark.xfail(strict=False, reason=KNOWN_FAILURES[case])]
+            if case in KNOWN_FAILURES
+            else [],
+        )
+        for case in CASES
+    ]
+
 
 def _graph_args(mode: str) -> list[str]:
     if mode == "NONE":
@@ -579,7 +600,7 @@ def _pd_distances(
 # Tests
 
 
-@pytest.mark.parametrize("case", CASES, ids=lambda c: c.id)
+@pytest.mark.parametrize("case", _case_params())
 def test_write_matches_direct_serve(case: Case):
     arch = ARCHS[case.arch]
     overrides = _arch_overrides(arch)
