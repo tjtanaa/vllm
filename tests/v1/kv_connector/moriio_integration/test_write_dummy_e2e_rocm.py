@@ -28,7 +28,9 @@ transfer reproduces the direct serve's first-token log-probabilities exactly,
 so the comparison needs no noise allowance. The
 servers compile with Inductor's deterministic mode, since otherwise each one
 benchmarks its own reduction launch configs and separately started servers
-can drift apart by a few bf16 logit steps. Guards:
+can drift apart by a few bf16 logit steps, and run rotary embedding as vLLM's
+custom op, since on ROCm 10 the kernel Inductor generates for it gives
+different results from one compile to the next. Guards:
 
 * decode must report an external prefix-cache hit for every transferred token
   of every prompt, so the match is not a local recompute;
@@ -305,9 +307,12 @@ def _graph_args(mode: str) -> list[str]:
         return ["--enforce-eager"]
     # Inductor otherwise picks reduction launch configs by timing them, so each
     # separately compiled server may sum in a different order and drift by a
-    # few bf16 logit steps; deterministic mode fixes the choice.
+    # few bf16 logit steps; deterministic mode fixes the choice. On ROCm 10 the
+    # rotary embedding kernel Inductor generates also differs between
+    # compiles (deterministic mode does not cover it), so use the custom op.
     config = {
         "cudagraph_mode": mode,
+        "custom_ops": ["+rotary_embedding"],
         "inductor_compile_config": {"deterministic": True},
     }
     return ["--compilation-config", json.dumps(config)]
