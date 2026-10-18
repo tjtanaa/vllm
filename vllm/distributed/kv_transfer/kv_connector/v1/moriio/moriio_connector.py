@@ -1865,8 +1865,11 @@ class MoRIIOConnectorWorker:
         # In-progress READ transfers: req_id -> {layer_name: [statuses]}.
         # A KDA layer posts two reads (conv + ssm), so a layer maps to a list.
         self._recving_transfers: defaultdict[ReqId, dict] = defaultdict(dict)
-        # Values are (remote_host, remote_notify_port, transfer_id).
-        self._recving_transfers_callback_addr: dict[ReqId, tuple[str, str, str]] = {}
+        # Values are (remote_host, remote_notify_ports, transfer_id); every
+        # port gets the release (see _read_release_ports).
+        self._recving_transfers_callback_addr: dict[
+            ReqId, tuple[str, tuple[str, ...], str]
+        ] = {}
         # Monotonic-clock start times for each in-flight recv transfer.
         # Used by _pop_done_transfers to abort transfers whose RDMA
         # completion is lost, instead of hanging forever.
@@ -2856,15 +2859,16 @@ class MoRIIOConnectorWorker:
                 ]
                 state = self.moriio_wrapper.poll_transfer_batch(statuses)
                 if statuses and state is TransferBatchState.DONE:
-                    host, port, xfer_id = self._recving_transfers_callback_addr[req_id]
+                    host, ports, xfer_id = self._recving_transfers_callback_addr[req_id]
                     done_req_ids.add(xfer_id)
-                    self.moriio_wrapper.send_notify(
-                        xfer_id,
-                        host,
-                        port,
-                        message_type="release",
-                        message_fields={"consumer_tp_size": self.world_size},
-                    )
+                    for port in ports:
+                        self.moriio_wrapper.send_notify(
+                            xfer_id,
+                            host,
+                            port,
+                            message_type="release",
+                            message_fields={"consumer_tp_size": self.world_size},
+                        )
                     to_remove.append(req_id)
                 elif state is TransferBatchState.FAILED:
                     failed_status = next(
@@ -2879,15 +2883,16 @@ class MoRIIOConnectorWorker:
                         failed_status.Code() if failed_status else "unknown",
                     )
                     self._record_failed_recv(req_id)
-                    host, port, xfer_id = self._recving_transfers_callback_addr[req_id]
+                    host, ports, xfer_id = self._recving_transfers_callback_addr[req_id]
                     try:
-                        self.moriio_wrapper.send_notify(
-                            xfer_id,
-                            host,
-                            port,
-                            message_type="release",
-                            message_fields={"consumer_tp_size": self.world_size},
-                        )
+                        for port in ports:
+                            self.moriio_wrapper.send_notify(
+                                xfer_id,
+                                host,
+                                port,
+                                message_type="release",
+                                message_fields={"consumer_tp_size": self.world_size},
+                            )
                     except Exception:
                         logger.exception(
                             "Failed to send error notification for request %s",
@@ -3677,6 +3682,38 @@ class MoRIIOConnectorWorker:
         except Exception:
             return False
 
+    def _read_release_ports(
+        self,
+        remote_notify_port: int,
+        remote_dp_rank: int,
+        eff_tp: int,
+        remote_tp_size: int,
+    ) -> tuple[str, ...]:
+        """Notify ports of every prefill rank this decode rank releases.
+
+        Prefill frees a request's blocks only once all of its TP ranks report
+        it sent, and a rank reports only when it gets a release. With more
+        prefill than decode TP ranks, this decode rank reads from one rank of
+        its group (eff_tp) but stands in for the whole group, so every rank in
+        it is released; otherwise the unread ranks hold their blocks until the
+        scheduler's defer_timeout reaps them.
+        """
+        if remote_tp_size <= self.world_size:
+            group = range(eff_tp, eff_tp + 1)
+        else:
+            # With decode TP 1 the group is every prefill rank, which also
+            # covers the flexible mirror's round-robin source.
+            group_size = remote_tp_size // self.world_size
+            first = (eff_tp // group_size) * group_size
+            group = range(first, first + group_size)
+        return tuple(
+            str(
+                remote_notify_port
+                + get_port_offset(remote_dp_rank, tp_rank, remote_tp_size)
+            )
+            for tp_rank in group
+        )
+
     def _read_blocks(
         self,
         local_block_ids: BlockIds,
@@ -3709,25 +3746,22 @@ class MoRIIOConnectorWorker:
             if chosen_tp is not None
             else self._remote_tp_rank(remote_tp_size)
         )
+        release_ports = self._read_release_ports(
+            remote_notify_port, int(remote_dp_rank), eff_tp, remote_tp_size
+        )
         if not any(local_block_ids):
             # A request aborted before decode allocation still carries the
             # producer's block table. There is no local destination or forward,
             # so release the producer blocks without building sessions or
             # posting RDMA reads.
-            self.moriio_wrapper.send_notify(
-                transfer_id,
-                remote_host,
-                str(
-                    remote_notify_port
-                    + get_port_offset(
-                        int(remote_dp_rank),
-                        eff_tp,
-                        remote_tp_size,
-                    )
-                ),
-                message_type="release",
-                message_fields={"consumer_tp_size": self.world_size},
-            )
+            for port in release_ports:
+                self.moriio_wrapper.send_notify(
+                    transfer_id,
+                    remote_host,
+                    port,
+                    message_type="release",
+                    message_fields={"consumer_tp_size": self.world_size},
+                )
             return
 
         if self._has_mamba:
@@ -3844,13 +3878,6 @@ class MoRIIOConnectorWorker:
                     self._mamba_reads_this_step.extend(statuses)
                 self._recving_transfers_callback_addr[request_id] = (
                     remote_host,
-                    str(
-                        remote_notify_port
-                        + get_port_offset(
-                            int(remote_dp_rank),
-                            eff_tp,
-                            remote_tp_size,
-                        )
-                    ),
+                    release_ports,
                     transfer_id,
                 )

@@ -333,7 +333,7 @@ def test_read_completion_sends_structured_release_with_consumer_tp_size():
     # A layer maps to the list of reads posted for it (a KDA layer posts two).
     worker._recving_transfers = {"req": {"layer0": [DoneStatus(), DoneStatus()]}}
     worker._recving_transfers_callback_addr = {
-        "req": ("127.0.0.1", "7000", "tx-release")
+        "req": ("127.0.0.1", ("7000",), "tx-release")
     }
     # Transfer-timeout reaping state consulted by _pop_done_transfers.
     worker._recving_transfers_start = {}
@@ -402,6 +402,127 @@ def test_aborted_read_without_local_blocks_only_releases_remote_blocks():
     ]
 
 
+@pytest.mark.parametrize(
+    ("decode_tp", "prefill_tp", "eff_tp", "expected_ranks"),
+    [
+        pytest.param(2, 2, 1, [1], id="equal-tp"),
+        pytest.param(4, 2, 1, [1], id="decode-fan-out"),
+        pytest.param(2, 4, 0, [0, 1], id="fan-in-first-group"),
+        pytest.param(2, 4, 2, [2, 3], id="fan-in-second-group"),
+        pytest.param(1, 4, 2, [0, 1, 2, 3], id="flexible-mirror"),
+    ],
+)
+def test_read_release_ports_cover_every_prefill_rank_of_the_group(
+    decode_tp, prefill_tp, eff_tp, expected_ranks
+):
+    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker.world_size = decode_tp
+
+    ports = worker._read_release_ports(7000, 0, eff_tp, prefill_tp)
+
+    assert ports == tuple(str(7000 + rank) for rank in expected_ranks)
+
+
+class _ReleaseRecordingWrapper:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.sent = []
+
+    poll_transfer_batch = MoRIIOWrapper.poll_transfer_batch
+
+    def send_notify(
+        self, transfer_id, host, port, message_type=None, message_fields=None
+    ):
+        self.sent.append((transfer_id, port, message_type, message_fields))
+
+    def shutdown(self):
+        pass
+
+
+class _DoneStatus:
+    def Succeeded(self):
+        return True
+
+    def Failed(self):
+        return False
+
+
+@pytest.mark.parametrize(
+    ("prefill_tp", "decode_tp"),
+    [(2, 2), (1, 2), (2, 4), (2, 1), (4, 2), (4, 1), (8, 2)],
+)
+def test_completed_reads_release_every_prefill_rank_exactly_once(prefill_tp, decode_tp):
+    """Prefill frees a request only once all its TP ranks report it sent.
+
+    Each decode rank reads from one prefill rank and releases the ranks it
+    stands for; every prefill rank must then resolve the transfer, or the
+    request's blocks wait for the scheduler's defer_timeout.
+    """
+    sent = []
+    for decode_rank in range(decode_tp):
+        worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+        worker.world_size = decode_tp
+        worker.tp_rank = decode_rank
+        worker.moriio_config = SimpleNamespace(recv_abort_timeout=600.0)
+        worker.moriio_wrapper = _ReleaseRecordingWrapper()
+        worker._recving_transfers = {"req": {"layer0": [_DoneStatus()]}}
+        eff_tp = worker._remote_tp_rank(prefill_tp)
+        worker._recving_transfers_callback_addr = {
+            "req": (
+                "127.0.0.1",
+                worker._read_release_ports(7000, 0, eff_tp, prefill_tp),
+                "tx",
+            )
+        }
+        worker._recving_transfers_start = {}
+        worker._recving_local_blocks = {}
+        worker._invalid_block_ids = set()
+
+        assert worker._pop_done_transfers() == {"tx"}
+        sent.extend(worker.moriio_wrapper.sent)
+
+    for prefill_rank in range(prefill_tp):
+        counts: dict[str, int] = {}
+        completed: set[str] = set()
+        resolved = [
+            resolve_moriio_transfer_ack(
+                MoRIIOTransferAck(transfer_id, fields["consumer_tp_size"]),
+                producer_tp_size=prefill_tp,
+                live_transfer_ids={"tx"},
+                notification_counts=counts,
+                completed_transfer_ids=completed,
+            )
+            for transfer_id, port, message_type, fields in sent
+            if port == str(7000 + prefill_rank) and message_type == "release"
+        ]
+        assert [r for r in resolved if r is not None] == ["tx"], prefill_rank
+        assert counts == {}, prefill_rank
+
+
+def test_aborted_fan_in_read_releases_every_prefill_rank_of_the_group():
+    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker.mode = MoRIIOMode.READ
+    worker.world_size = 2
+    worker.tp_rank = 1
+    worker.moriio_wrapper = _ReleaseRecordingWrapper()
+
+    worker._read_blocks(
+        local_block_ids=[],
+        remote_block_ids=[[10, 11]],
+        dst_engine_id="prefill",
+        request_id="req-aborted",
+        transfer_id="tx-aborted",
+        remote_host="127.0.0.1",
+        remote_notify_port=7000,
+        remote_tp_size=4,
+    )
+
+    assert worker.moriio_wrapper.sent == [
+        ("tx-aborted", "7002", "release", {"consumer_tp_size": 2}),
+        ("tx-aborted", "7003", "release", {"consumer_tp_size": 2}),
+    ]
+
+
 def test_read_completion_waits_for_every_posted_read():
     class Status:
         def __init__(self, done: bool):
@@ -434,7 +555,7 @@ def test_read_completion_waits_for_every_posted_read():
         "req": {"kda_layer": [Status(done=True), Status(done=False)]}
     }
     worker._recving_transfers_callback_addr = {
-        "req": ("127.0.0.1", "7000", "tx-pending")
+        "req": ("127.0.0.1", ("7000",), "tx-pending")
     }
     worker._recving_transfers_start = {"req": float("inf")}
     worker._recving_local_blocks = {"req": [1, 2]}
