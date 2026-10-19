@@ -357,10 +357,13 @@ READ_CASES = [
     Case("deepseek_v3", "ROCM_AITER_MLA", _DEFAULT, _DEFAULT, True, read_mode=True),
     Case("gemma3", "TRITON_ATTN", _DEFAULT, _DEFAULT, True, read_mode=True),
 ]
-# READ mode between different TP sizes: MLA latents are replicated, so decode
-# TP2 reads its copy from prefill TP1 and decode TP1 reads one copy from
-# prefill TP2, releasing both.
+# READ mode, decode TP2 pulling from prefill TP1 (each decode rank reads its
+# heads and state slice) and decode TP1 pulling from prefill TP2. A fan-in read
+# of split heads or recurrent state needs a session to the second prefill GPU,
+# which MoRI's xGMI backend cannot open from a decode rank that sees one GPU;
+# those cases only run over RDMA (MORIIO_DUMMY_E2E_BACKEND=rdma).
 HETEROGENEOUS_TP_READ_CASES = [
+    Case("qwen3_dense", "TRITON_ATTN", _DEFAULT, _DEFAULT, decode_tp=2, read_mode=True),
     Case(
         "deepseek_v3",
         "ROCM_AITER_MLA",
@@ -371,6 +374,12 @@ HETEROGENEOUS_TP_READ_CASES = [
         read_mode=True,
     ),
     Case(
+        "gemma3", "TRITON_ATTN", _DEFAULT, _DEFAULT, True, decode_tp=2, read_mode=True
+    ),
+    Case("qwen3_5_moe", "TRITON_ATTN", _DEFAULT, _DEFAULT, decode_tp=2, read_mode=True),
+    # MLA fan-in reads the replicated latent from one prefill rank and
+    # releases both.
+    Case(
         "deepseek_v3",
         "ROCM_AITER_MLA",
         _DEFAULT,
@@ -379,7 +388,22 @@ HETEROGENEOUS_TP_READ_CASES = [
         prefill_tp=2,
         read_mode=True,
     ),
+    Case(
+        "qwen3_dense", "TRITON_ATTN", _DEFAULT, _DEFAULT, prefill_tp=2, read_mode=True
+    ),
+    Case(
+        "qwen3_5_moe", "TRITON_ATTN", _DEFAULT, _DEFAULT, prefill_tp=2, read_mode=True
+    ),
 ]
+
+
+def _reads_every_prefill_gpu(case: Case) -> bool:
+    """A READ fan-in that must reach a prefill GPU beyond the first."""
+    return (
+        case.read_mode
+        and case.prefill_tp > case.decode_tp
+        and (ARCHS[case.arch].hybrid or case.arch != "deepseek_v3")
+    )
 
 
 def _graph_args(mode: str) -> list[str]:
@@ -885,6 +909,8 @@ def test_heterogeneous_tp_hands_decode_every_prompt_token(case: Case):
     _, devices = _visible_devices()
     if len(devices) < case.prefill_tp + case.decode_tp:
         pytest.skip(f"needs {case.prefill_tp + case.decode_tp} GPUs")
+    if BACKEND == "xgmi" and _reads_every_prefill_gpu(case):
+        pytest.skip("MoRI xGMI cannot open a session to a GPU decode does not see")
     arch = ARCHS[case.arch]
     overrides = _arch_overrides(arch)
     with _pd_pair(arch, overrides, overrides, case) as (proxy_url, decode):

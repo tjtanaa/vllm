@@ -20,12 +20,12 @@ import torch
 from vllm.distributed.kv_transfer.kv_connector.v1 import ssm_conv_transfer_utils
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     MoRIIOAgentMetadata,
+    MoRIIOError,
     MoRIIOMode,
     MoRIIOTransferAck,
     ReqMeta,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import (
-    get_moriio_read_holder_tp_ranks,
     resolve_moriio_transfer_ack,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_engine import (
@@ -38,6 +38,7 @@ from .test_moriio_hetero_tp_write import (
     MODELS,
     NUM_BLOCKS,
     PREFILL_BLOCKS,
+    SCENARIOS,
     Rank,
     _build_rank,
     _expected,
@@ -262,19 +263,15 @@ def test_equal_tp_read_lands_every_byte(model, hma, tp, layouts):
 
 @pytest.mark.parametrize("layouts", LAYOUTS, ids=LAYOUT_IDS)
 @pytest.mark.parametrize(
-    ("model", "producer_tp", "consumer_tp"),
-    [
-        *(("mla", p, d) for p, d in [(1, 2), (2, 4), (2, 1), (4, 2), (1, 4), (4, 1)]),
-        # Two KV heads are replicated once both sides have at least two ranks.
-        ("gqa_replicated", 2, 4),
-        ("gqa_replicated", 4, 2),
-    ],
+    ("model", "producer_tp", "consumer_tp", "hma"),
+    [scenario for scenario in SCENARIOS if scenario[1] != scenario[2]],
 )
-def test_replicated_read_releases_every_holder(
-    model, producer_tp, consumer_tp, layouts
+def test_hetero_tp_read_lands_every_shard(
+    model, producer_tp, consumer_tp, hma, layouts
 ):
-    """In fan-in each decode rank reads one copy and releases every holder."""
-    releases = _read_all(model, producer_tp, consumer_tp, True, layouts)
+    """Each decode rank reads its head and state slices from every prefill
+    rank that holds them, and releases every holder."""
+    releases = _read_all(model, producer_tp, consumer_tp, hma, layouts)
     _assert_released(releases, producer_tp)
 
 
@@ -331,9 +328,7 @@ def test_aborted_read_releases_every_holder(producer_tp, consumer_tp):
             remote_notify_port=NOTIFY_PORT,
             remote_tp_size=producer_tp,
         )
-        holders = get_moriio_read_holder_tp_ranks(
-            consumer.tp_rank, consumer_tp, producer_tp
-        )
+        holders = consumer.worker._read_plan(producer_tp, None)[1]
         assert sorted(p for p, _, _ in released) == sorted(holders)
         assert consumer.sent == []
 
@@ -350,17 +345,74 @@ def test_failed_read_releases_every_holder():
     assert consumer.worker._invalid_block_ids == set(DECODE_BLOCKS["full"])
 
 
-@pytest.mark.parametrize(
-    ("local_tp_rank", "local_tp_size", "remote_tp_size", "expected"),
-    [
-        (1, 2, 2, (1,)),
-        (3, 4, 2, (1,)),
-        (1, 2, 4, (2, 3)),
-        (0, 1, 8, tuple(range(8))),
-    ],
-)
-def test_read_holder_tp_ranks(local_tp_rank, local_tp_size, remote_tp_size, expected):
-    assert (
-        get_moriio_read_holder_tp_ranks(local_tp_rank, local_tp_size, remote_tp_size)
-        == expected
-    )
+def test_read_refuses_peer_with_different_block_size():
+    """Hybrid MLA models get TP-dependent attention block sizes; reading blocks
+    between them would misplace tokens, so the read must refuse."""
+    heads, layers = MODELS["mla"]
+    state = _global_state(layers, heads)
+    producers, (consumer,) = _ranks("mla", 2, 1, True, LAYOUTS[0], state)
+    for layer in layers:
+        producers[0].worker.attention_block_sizes[layer.name] *= 2
+    _make_reader(consumer, producers, "xgmi")
+    with pytest.raises(MoRIIOError, match="same --block-size"):
+        consumer.worker._read_blocks_for_req("req", _meta(["full"], 2))
+
+
+def test_sharded_read_needs_head_layouts():
+    """A peer that does not advertise head layouts (an older vLLM) cannot be
+    read by head slice."""
+    heads, layers = MODELS["gqa"]
+    state = _global_state(layers, heads)
+    producers, (consumer,) = _ranks("gqa", 2, 1, True, LAYOUTS[0], state)
+    for producer in producers:
+        producer.worker.kv_head_layouts = {}
+    _make_reader(consumer, producers, "xgmi")
+    with pytest.raises(MoRIIOError, match="Heterogeneous-TP READ"):
+        consumer.worker._read_blocks_for_req("req", _meta(["full"], 2))
+
+
+def test_equal_tp_read_keeps_the_dp_session_and_one_release():
+    """Equal TP is unchanged: one source, the DP-keyed session, one release."""
+    heads, layers = MODELS["gqa"]
+    state = _global_state(layers, heads)
+    producers, consumers = _ranks("gqa", 2, 2, True, LAYOUTS[0], state)
+    keys: list[str] = []
+    for consumer in consumers:
+        released = _make_reader(consumer, producers, "xgmi")
+        built = consumer.worker._get_built_session
+
+        def record(engine_id, built=built):
+            keys.append(engine_id)
+            return built(engine_id)
+
+        consumer.worker._get_built_session = record
+        consumer.worker._read_blocks_for_req("req", _meta(["full"], 2))
+        consumer.worker._pop_done_transfers()
+        assert [p for p, _, _ in released] == [consumer.tp_rank]
+    assert keys == ["prefill_dp0", "prefill_dp0"]
+
+
+def test_background_handshake_dials_every_read_source():
+    """A heterogeneous-TP READ keys sessions per (dp, tp) source, so the lazy
+    handshake must open exactly those."""
+    heads, layers = MODELS["gqa"]
+    state = _global_state(layers, heads)
+    _, (consumer,) = _ranks("gqa", 4, 1, True, LAYOUTS[0], state)
+    worker = consumer.worker
+    worker.mode = MoRIIOMode.READ
+    worker.is_producer = False
+    submitted = []
+
+    class Executor:
+        def submit(self, fn, *args):
+            submitted.append(args)
+            return SimpleNamespace(
+                result=lambda: True, add_done_callback=lambda callback: None
+            )
+
+    worker._handshake_initiation_executor = Executor()
+    worker._handshake_futures = {}
+    worker._handshake_lock = threading.Lock()
+    worker._background_moriio_handshake("req", "prefill", _meta(["full"], 4))
+    dialed = [(args[3], args[5]) for args in submitted if len(args) == 6]
+    assert dialed == [(f"prefill_dp0_tp{p}", p) for p in range(4)]
