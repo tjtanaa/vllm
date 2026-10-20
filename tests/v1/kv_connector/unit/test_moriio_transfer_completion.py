@@ -131,17 +131,32 @@ def test_wait_blocks_until_terminal():
         timer.cancel()
 
 
-@pytest.mark.parametrize("timeout,expected_ms", [(0.05, 50), (0.0001, 1)])
-def test_native_wait_receives_all_statuses_and_a_positive_deadline(
-    timeout, expected_ms
-):
+@pytest.mark.parametrize("timeout", [0.05, 0.0001])
+def test_native_wait_receives_all_statuses_and_a_positive_slice(timeout):
     statuses = [_pending(), _ok()]
     engine = SimpleNamespace(
         wait_all=Mock(return_value=moriio_engine.StatusCode.SUCCESS)
     )
     wrapper = MoRIIOWrapper(moriio_engine=engine, transfer_timeout=timeout)
     wrapper.waiting_for_transfer_complete(statuses)
-    engine.wait_all.assert_called_once_with(statuses, timeout_ms=expected_ms)
+    engine.wait_all.assert_called_once_with(
+        statuses, timeout_ms=moriio_engine._WAIT_SLICE_MS
+    )
+
+
+def test_native_wait_retries_in_slices_until_done():
+    """A bounded Mori wait polls xGMI progress only when it wakes, so keep
+    waiting in slices until every status has finished."""
+    statuses = [_pending(), _pending()]
+    code = moriio_engine.StatusCode
+    engine = SimpleNamespace(
+        wait_all=Mock(side_effect=[code.IN_PROGRESS, code.IN_PROGRESS, code.SUCCESS])
+    )
+    wrapper = MoRIIOWrapper(moriio_engine=engine, transfer_timeout=30.0)
+    start = time.monotonic()
+    wrapper.waiting_for_transfer_complete(statuses)
+    assert engine.wait_all.call_count == 3
+    assert time.monotonic() - start < 1.0
 
 
 @pytest.mark.parametrize(
@@ -186,5 +201,7 @@ def test_native_wait_drains_only_the_unscoped_status_snapshot():
     wrapper = MoRIIOWrapper(moriio_engine=engine, transfer_timeout=0.05)
     wrapper.transfer_status.extend(statuses)
     wrapper.waiting_for_transfer_complete()
-    engine.wait_all.assert_called_once_with(statuses, timeout_ms=50)
+    engine.wait_all.assert_called_once_with(
+        statuses, timeout_ms=moriio_engine._WAIT_SLICE_MS
+    )
     assert wrapper.transfer_status == []

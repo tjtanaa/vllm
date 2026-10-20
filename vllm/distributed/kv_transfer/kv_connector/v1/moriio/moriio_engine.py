@@ -3,7 +3,6 @@
 import threading
 import time
 from collections import OrderedDict, defaultdict
-from math import ceil
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any
 from weakref import ref as weakref_ref
@@ -717,6 +716,10 @@ class MoRIIOWriter:
         )
 
 
+# Slice of a bounded Mori wait; progress is polled once per slice.
+_WAIT_SLICE_MS = 1
+
+
 class MoRIIOWrapper:
     """Wrapper for MoRIIO engine operations.
 
@@ -909,10 +912,16 @@ class MoRIIOWrapper:
             self._poll_transfers_until_done(transfers_to_wait)
             return
 
-        # Zero means a nonblocking progress call in Mori, not an immediate
-        # deadline. Round up so even sub-millisecond waits remain blocking.
-        timeout_ms = ceil(self._transfer_timeout * 1000)
-        result = wait_all(transfers_to_wait, timeout_ms=timeout_ms)
+        # A bounded Mori wait sleeps until a status notifies and only polls
+        # progress when it wakes. xGMI statuses complete by polling and never
+        # notify, so one wait of the whole timeout sleeps to its deadline, and
+        # every status after the first then reports IN_PROGRESS. Wait in short
+        # slices (zero would be a single nonblocking poll) up to the deadline.
+        deadline = time.monotonic() + self._transfer_timeout
+        while True:
+            result = wait_all(transfers_to_wait, timeout_ms=_WAIT_SLICE_MS)
+            if result != StatusCode.IN_PROGRESS or time.monotonic() >= deadline:
+                break
         if result != StatusCode.SUCCESS:
             details = [
                 f"{status.Message()} (code={status.Code()})"
