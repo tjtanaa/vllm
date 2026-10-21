@@ -37,6 +37,10 @@ separately started servers can drift apart by a few bf16 logit steps. Guards:
 * ``test_corrupted_prefill_state_is_detected`` makes prefill compute its KV with
   a different norm epsilon (same shapes, different values) and requires every
   prompt to fail the comparison.
+
+``test_full_length_transfer_finishes_promptly`` times production-sized
+transfers instead: unchunked prompts of ``LATENCY_PROMPT_LEN`` tokens, in WRITE
+and in READ mode, must each finish within ``LATENCY_LIMIT_S`` through the proxy.
 """
 
 import atexit
@@ -93,6 +97,13 @@ MAX_MODEL_LEN = 4096
 # the final-chunk save path runs; the short prompt fills exactly one chunk.
 PREFILL_CHUNK = 299
 SHORT_PROMPT_LEN = PREFILL_CHUNK + 1
+# Full-length prompts of the latency check, each prefilled in one chunk. A
+# transfer that waits on a MoRI deadline instead of its completion takes the
+# 30 s transfer timeout or longer, while a whole P/D request takes well under
+# a second, so the limit leaves a wide margin either way.
+LATENCY_PROMPT_LEN = 2048
+LATENCY_PROMPTS = 4
+LATENCY_LIMIT_S = 10.0
 # Hybrid blocks per aligned prompt, before the trailing token.
 ALIGNED_BLOCKS = (1, 2)
 # Prefill chunks per long attention-only prompt, before the trailing token.
@@ -136,6 +147,11 @@ def _kimi_linear_overrides(cfg) -> dict[str, Any]:
         "num_experts_per_token": 2,
         "topk_group": min(cfg.topk_group, groups),
     }
+
+
+def _qwen3_5_moe_full_depth_overrides(cfg) -> dict[str, Any]:
+    # Every layer of the real model (30 Gated DeltaNet, 10 full attention).
+    return {"text_config": {"num_experts": 4, "num_experts_per_tok": 2}}
 
 
 def _qwen3_5_moe_overrides(cfg) -> dict[str, Any]:
@@ -208,6 +224,15 @@ ARCHS: dict[str, ArchCase] = {
         env={"VLLM_ROCM_USE_AITER": "0"},
         args=("--language-model-only",),
     ),
+    # A READ waits on every layer's transfers at once, and over the few layers
+    # of qwen3_5_moe they are all done by the first progress poll.
+    "qwen3_5_moe_full_depth": ArchCase(
+        model="Qwen/Qwen3.5-35B-A3B",
+        overrides=_qwen3_5_moe_full_depth_overrides,
+        corrupt_overrides={"text_config": {"rms_norm_eps": 1.0}},
+        env={"VLLM_ROCM_USE_AITER": "0"},
+        args=("--language-model-only",),
+    ),
     "qwen3_dense": ArchCase(
         model="Qwen/Qwen3-32B",
         overrides=_qwen3_dense_overrides,
@@ -267,11 +292,22 @@ class Case:
     decode_tp: int = 1
     # Extra arguments for every server of the case.
     server_args: tuple[str, ...] = ()
+    # Decode pulls the KV (READ) instead of prefill pushing it (WRITE).
+    read_mode: bool = False
+    # Prefill token budget of every server of the case.
+    max_num_batched_tokens: int = PREFILL_CHUNK
 
     @property
     def extra_args(self) -> tuple[str, ...]:
         hma = ("--disable-hybrid-kv-cache-manager",) if self.hma_off else ()
         return hma + self.server_args
+
+    @property
+    def env(self) -> dict[str, str]:
+        # ROCM_AITER_FA is only available with AITER enabled.
+        if self.attention_backend == "ROCM_AITER_FA":
+            return {"VLLM_ROCM_USE_AITER": "1"}
+        return {}
 
     @property
     def heterogeneous_tp(self) -> bool:
@@ -288,6 +324,7 @@ class Case:
                 if self.heterogeneous_tp
                 else ""
             )
+            + ("-READ" if self.read_mode else "")
         )
 
 
@@ -338,6 +375,40 @@ HETEROGENEOUS_TP_CASES = [
         _DEFAULT,
         prefill_tp=2,
         server_args=("--block-size", "2048"),
+    ),
+]
+
+
+# Full-length transfers on every attention backend of each model kind: GQA
+# attention-only, Gated DeltaNet hybrid, and MLA, in WRITE mode, and the hybrid
+# model in READ mode.
+# TODO: ROCM_AITER_FA with VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=1 is not covered:
+# MoRIIO WRITE fails every transfer of the shuffled cache ("Head slice local
+# [0, 8) / remote [0, 8) is outside 2 / 2 heads").
+_GQA_BACKENDS = ("TRITON_ATTN", "ROCM_AITER_UNIFIED_ATTN", "ROCM_AITER_FA")
+# TODO: Gated DeltaNet with ROCM_AITER_FA is not covered. The backend needs
+# VLLM_ROCM_USE_AITER=1, which enables AITER's GDN conv-update kernel, and that
+# kernel rejects the DS conv-state layout MoRIIO's state transfer uses.
+_GDN_BACKENDS = ("TRITON_ATTN", "ROCM_AITER_UNIFIED_ATTN")
+_MLA_BACKENDS = ("TRITON_MLA", "ROCM_AITER_MLA")
+_LATENCY = {"max_num_batched_tokens": LATENCY_PROMPT_LEN}
+LATENCY_CASES = [
+    *(Case("qwen3_dense", b, _DEFAULT, _DEFAULT, **_LATENCY) for b in _GQA_BACKENDS),
+    *(Case("qwen3_5_moe", b, _DEFAULT, _DEFAULT, **_LATENCY) for b in _GDN_BACKENDS),
+    *(
+        Case("deepseek_v3", b, _DEFAULT, _DEFAULT, True, **_LATENCY)
+        for b in _MLA_BACKENDS
+    ),
+    *(
+        Case(
+            "qwen3_5_moe_full_depth",
+            b,
+            _DEFAULT,
+            _DEFAULT,
+            read_mode=True,
+            **_LATENCY,
+        )
+        for b in _GDN_BACKENDS
     ),
 ]
 
@@ -404,6 +475,8 @@ def _server(
     port: int | None = None,
     extra_args: tuple[str, ...] = (),
     kv_transfer_config: dict[str, Any] | None = None,
+    max_num_batched_tokens: int = PREFILL_CHUNK,
+    extra_env: dict[str, str] | None = None,
 ) -> RemoteOpenAIServer:
     port = port or get_open_port()
     args = [
@@ -424,7 +497,7 @@ def _server(
         "--max-model-len",
         str(MAX_MODEL_LEN),
         "--max-num-batched-tokens",
-        str(PREFILL_CHUNK),
+        str(max_num_batched_tokens),
         "--max-num-seqs",
         "16",
         "--kv-cache-memory-bytes",
@@ -454,19 +527,22 @@ def _server(
         ),
         "MORIIO_DUMMY_WEIGHT_RANGE": str(DUMMY_WEIGHT_RANGE),
         **arch.env,
+        **(extra_env or {}),
     }
     return RemoteOpenAIServer(
         arch.model, args, env_dict=env, auto_port=False, max_wait_seconds=900
     )
 
 
-def _moriio_config(role: str, http_port: int, ping_port: int) -> dict[str, Any]:
+def _moriio_config(
+    role: str, http_port: int, ping_port: int, read_mode: bool = False
+) -> dict[str, Any]:
     return {
         "kv_connector": "MoRIIOConnector",
         "kv_role": role,
         "kv_connector_extra_config": {
             "backend": BACKEND,
-            "read_mode": False,
+            "read_mode": read_mode,
             "host_ip": "127.0.0.1",
             "proxy_ip": "127.0.0.1",
             "proxy_ping_port": str(ping_port),
@@ -545,8 +621,10 @@ def _pd_pair(
                     port=prefill_port,
                     extra_args=case.extra_args,
                     kv_transfer_config=_moriio_config(
-                        "kv_producer", prefill_port, ping_port
+                        "kv_producer", prefill_port, ping_port, case.read_mode
                     ),
+                    max_num_batched_tokens=case.max_num_batched_tokens,
+                    extra_env=case.env,
                 ),
                 pool.submit(
                     _server,
@@ -559,8 +637,10 @@ def _pd_pair(
                     port=decode_port,
                     extra_args=case.extra_args,
                     kv_transfer_config=_moriio_config(
-                        "kv_consumer", decode_port, ping_port
+                        "kv_consumer", decode_port, ping_port, case.read_mode
                     ),
+                    max_num_batched_tokens=case.max_num_batched_tokens,
+                    extra_env=case.env,
                 ),
             ]
             for future in futures:
@@ -708,6 +788,8 @@ def _reference(
         devices,
         selector,
         extra_args=case.extra_args,
+        max_num_batched_tokens=case.max_num_batched_tokens,
+        extra_env=case.env,
     ) as server:
         url = server.url_root
         lengths = _prompt_lengths(arch, server)
@@ -807,7 +889,7 @@ def test_heterogeneous_tp_write_hands_decode_every_prompt_token(case: Case):
     ), f"decode returned non-finite log-probs: {tops}"
 
 
-@pytest.mark.parametrize("arch_name", sorted(ARCHS))
+@pytest.mark.parametrize("arch_name", sorted({c.arch for c in CASES}))
 def test_corrupted_prefill_state_is_detected(arch_name: str):
     """Negative control: KV computed with different values must fail."""
     arch = ARCHS[arch_name]
@@ -827,4 +909,37 @@ def test_corrupted_prefill_state_is_detected(arch_name: str):
         f"P/D outputs with wrongly computed prefill KV still matched the "
         f"reference (distances {distances}); the comparison cannot detect "
         "transfer corruption"
+    )
+
+
+@pytest.mark.parametrize("case", LATENCY_CASES, ids=lambda c: c.id)
+def test_full_length_transfer_finishes_promptly(case: Case):
+    """Unchunked full-length prompts finish once their KV has landed.
+
+    MoRI completes xGMI transfers by polling, so a wait that sleeps until a
+    status notifies holds every request for the whole transfer timeout. Long
+    single-chunk prompts give each request many in-flight transfers to wait on.
+    """
+    arch = ARCHS[case.arch]
+    overrides = _arch_overrides(arch)
+    prompts = _prompts([LATENCY_PROMPT_LEN] * LATENCY_PROMPTS)
+    with _pd_pair(arch, overrides, overrides, case) as (proxy_url, decode):
+        hits_before = _external_hits(decode)
+        elapsed = []
+        for prompt in prompts:
+            start = time.monotonic()
+            top = _first_step(proxy_url, arch.model, prompt)
+            elapsed.append(time.monotonic() - start)
+            assert all(math.isfinite(v) for v in top.values()), top
+        hits = _external_hits(decode) - hits_before
+    print(f"[latency] {case.id} seconds={[round(t, 3) for t in elapsed]}")
+
+    expected = sum(len(p) - int(arch.hybrid) for p in prompts)
+    assert hits == expected, (
+        f"decode reported {hits} external prefix-cache hits, expected {expected}"
+    )
+    slow = [round(t, 1) for t in elapsed if t >= LATENCY_LIMIT_S]
+    assert not slow, (
+        f"P/D requests of {LATENCY_PROMPT_LEN} tokens took {slow} s "
+        f"(limit {LATENCY_LIMIT_S} s); transfers waited past their completion"
     )
