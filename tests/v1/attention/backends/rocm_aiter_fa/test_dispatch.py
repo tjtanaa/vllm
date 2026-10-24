@@ -19,6 +19,8 @@ Dispatch table (rocm_aiter_fa.py, AiterFlashAttentionImpl.forward):
 | D6  | decode  | non-causal                        | mha_v3 flash_attn_with_kvcache |
 | D7  | decode  | shuffle layout                    | paged_attention_common         |
 | D8  | decode  | head < 64                         | unified_attention              |
+| U1  | any     | soft cap, sinks or ALiBi, with    | unified_attention for the      |
+|     |         | prefill or extend rows (causal)   | whole batch                    |
 | S1  | any     | KV-sharing / update-bypass layer  | gather new K/V from the cache  |
 |     |         | with prefill or extend rows       | before prefill/extend          |
 | X1  | -       | attn_metadata is None (profiling) | none, output zeroed            |
@@ -33,6 +35,7 @@ import pytest
 import torch
 
 from tests.v1.attention.backends.rocm_aiter_fa.fa_harness import (
+    DEVICE,
     GATHER,
     MERGE,
     MHA_V3,
@@ -218,9 +221,9 @@ def test_dispatch_row(row, kv_cache_dtype, spy, monkeypatch):
     "query_lens, seq_lens, kernels, window",
     [
         ([1, 1], [17, 300], {PAGED_V1: 1}, None),
-        ([33, 64], [33, 64], {VARLEN: 1}, None),
-        ([40, 3], [200, 19], {VARLEN: 2, GATHER: 1, MERGE: 1}, None),
-        ([40, 3], [400, 19], {VARLEN: 1, GATHER: 1}, SMALL_WINDOW),
+        ([33, 64], [33, 64], {UNIFIED: 1}, None),
+        ([40, 3], [200, 19], {UNIFIED: 1}, None),
+        ([40, 3], [400, 19], {UNIFIED: 1}, SMALL_WINDOW),
     ],
     ids=["decode", "prefill", "extend", "extend-swa"],
 )
@@ -292,10 +295,9 @@ def test_fused_output_quant_is_rejected():
     "case_kwargs, query_lens, threshold",
     [
         ({"sliding_window": SMALL_WINDOW}, [1, 1], 1),
-        ({"use_sinks": True}, [1, 1], 1),
         ({}, [4, 4], 4),
     ],
-    ids=["swa", "sinks", "spec"],
+    ids=["swa", "spec"],
 )
 def test_shuffle_rejects_unsupported_decode(
     monkeypatch, case_kwargs, query_lens, threshold
@@ -309,6 +311,19 @@ def test_shuffle_rejects_unsupported_decode(
     batch = case.batch(query_lens, seq_lens)
     with pytest.raises(AssertionError, match="Shuffle KV cache layout"):
         case.run(batch, case.query(batch.num_tokens))
+
+
+@pytest.mark.parametrize(
+    "feature",
+    [{"use_sinks": True}, {"use_alibi": True}, {"logits_soft_cap": 5.0}],
+    ids=["sinks", "alibi", "softcap"],
+)
+def test_shuffle_refuses_features_it_cannot_decode(feature, monkeypatch):
+    from tests.v1.attention.backends.rocm_aiter_fa.fa_harness import set_shuffle
+
+    set_shuffle(monkeypatch, True)
+    with pytest.raises(NotImplementedError, match="shuffle KV cache layout"):
+        FaCase(QWEN3_235B, **feature).setup(16)
 
 
 def test_padded_tokens_are_not_written():
@@ -337,3 +352,116 @@ def test_batch_order_from_each_model_runner(query_lens, seq_lens):
     batch = case.batch(query_lens, seq_lens)
     query = case.query(batch.num_tokens)
     case.check(batch, query, case.run(batch, query))
+
+
+FEATURES = {
+    "alibi": {"use_alibi": True},
+    "sinks": {"use_sinks": True},
+    "softcap": {"logits_soft_cap": 5.0},
+    "window": {"sliding_window": SMALL_WINDOW},
+    "window+sinks": {"sliding_window": SMALL_WINDOW, "use_sinks": True},
+    "window+alibi": {"sliding_window": SMALL_WINDOW, "use_alibi": True},
+    "window+softcap": {"sliding_window": SMALL_WINDOW, "logits_soft_cap": 5.0},
+}
+# (query_lens, seq_lens, decode threshold) per phase, contexts past the window.
+PHASE_BATCHES = {
+    "prefill": ([33, 130], [33, 130], 1),
+    "extend": ([40, 3], [400, 19], 1),
+    "decode": ([1, 1, 1], [17, 300, 1025], 1),
+    "spec-decode": ([4, 4, 2], [40, 300, 77], 4),
+    "mixed": ([1, 1, 40, 130], [100, 300, 200, 130], 1),
+}
+
+
+@pytest.mark.parametrize("phase", list(PHASE_BATCHES))
+@pytest.mark.parametrize("feature", list(FEATURES))
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+def test_feature_in_every_phase(feature, phase, kv_cache_dtype):
+    """Every attention feature the backend declares gives the right output in
+    every phase, i.e. through every kernel that phase can dispatch to."""
+    query_lens, seq_lens, threshold = PHASE_BATCHES[phase]
+    shape = MUSE_SPARK_SLIDING if "window" in feature else QWEN3_235B
+    case = FaCase(shape, kv_cache_dtype=kv_cache_dtype, **FEATURES[feature]).setup(
+        blocks_for(seq_lens, 16)
+    )
+    case.builder.reorder_batch_threshold = threshold
+    batch = case.batch(query_lens, seq_lens)
+    # Larger logits so the soft cap and ALiBi slopes matter; not with an fp8
+    # cache, whose decode error grows with the logits (see fa_harness).
+    gain = 1 if kv_cache_dtype == "fp8" else 4
+    query = case.query(batch.num_tokens) * gain
+    case.check(batch, query, case.run(batch, query))
+
+
+@pytest.mark.parametrize(
+    "query_lens, seq_lens, threshold",
+    [
+        ([33, 64], [33, 64], 1),
+        ([40, 3], [200, 19], 1),
+        ([4, 4], [40, 300], 4),
+        ([4, 40, 64], [100, 200, 64], 4),
+    ],
+    ids=["prefill", "extend", "decode", "mixed"],
+)
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+def test_non_causal_in_every_phase(query_lens, seq_lens, threshold, kv_cache_dtype):
+    """Non-causal batches (DSpark-style drafts) attend over the whole
+    sequence in every phase."""
+    case = FaCase(QWEN3_235B, kv_cache_dtype=kv_cache_dtype).setup(
+        blocks_for(seq_lens, 16)
+    )
+    case.builder.reorder_batch_threshold = threshold
+    batch = case.batch(query_lens, seq_lens, causal=False)
+    query = case.query(batch.num_tokens)
+    case.check(batch, query, case.run(batch, query))
+
+
+def test_kv_update_bypass_layer_reads_new_tokens_from_cache(spy):
+    """A layer whose KV write is done by a fused model op (no KV sharing)
+    gets key/value None and must gather its new tokens from the cache."""
+    q_lens, s_lens = [1, 40, 64], [100, 200, 64]
+    case = FaCase(MUSE_SPARK_SLIDING, sliding_window=SMALL_WINDOW)
+    case.setup(blocks_for(s_lens, 16))
+    case.layers["target"].kv_cache_update_bypass = True
+    from vllm.v1.attention.backends.rocm_aiter_fa import (
+        AiterFlashAttentionMetadataBuilder,
+    )
+
+    case.builder = AiterFlashAttentionMetadataBuilder(
+        case.builder.kv_cache_spec, ["target"], case.config, DEVICE
+    )
+    batch = case.batch(q_lens, s_lens)
+    query = case.query(batch.num_tokens)
+    output = torch.full_like(query, float("nan"))
+    spy.reset()
+    case.layer.impl.forward(
+        case.layer, query, None, None, case.kv_cache, case.build(batch), output
+    )
+    assert spy.names().count(GATHER) == 2, spy.names()
+    case.check(batch, query, output)
+
+
+def test_sliding_window_decode_past_table_capacity(spy):
+    """More decodes than the persistent window tables hold: the trimmed-table
+    kernel is skipped and the result must stay correct."""
+    s_lens = [300 + 37 * i for i in range(6)]
+    case = FaCase(MUSE_SPARK_SLIDING, sliding_window=SMALL_WINDOW, max_num_seqs=4)
+    case.setup(blocks_for(s_lens, 16))
+    batch = case.batch([1] * len(s_lens), s_lens)
+    query = case.query(batch.num_tokens)
+    spy.reset()
+    output = case.run(batch, query)
+    assert spy.names() == [UNIFIED]
+    case.check(batch, query, output)
+
+
+def test_drafting_metadata_runs_forward():
+    """build_for_drafting skips the phase split; forward on it must match a
+    regular build for the uniform decode batches drafting produces."""
+    q_lens, s_lens = [3, 3, 3], [40, 90, 500]
+    case = FaCase(QWEN3_235B).setup(blocks_for(s_lens, 16))
+    case.builder.reorder_batch_threshold = 3
+    batch = case.batch(q_lens, s_lens)
+    query = case.query(batch.num_tokens)
+    metadata = case.builder.build_for_drafting(batch.common, draft_index=0)
+    case.check(batch, query, case.run(batch, query, metadata))

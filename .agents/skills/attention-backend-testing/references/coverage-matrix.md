@@ -41,6 +41,8 @@ mark each row *covered (test id)*, *N/A (reason)* or *gap (issue)*.
 | C3 | Fused-output-quant arguments are rejected if unsupported. |
 | C4 | KV-sharing layers / KV-update-bypass layers read K/V from the cache for every phase. |
 | C5 | Non-causal and causal both reach the right kernel in every phase that allows them. |
+| C6 | Every declared feature (window, sinks, soft cap, ALiBi, and their combinations) x every phase (prefill, extend, decode, spec decode, mixed) x KV dtype gives the reference output. |
+| C7 | Branch coverage of the backend module under the unit suite; every uncovered branch is explained. |
 
 ## D. KV cache (L2)
 

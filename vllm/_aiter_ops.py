@@ -4533,11 +4533,7 @@ class rocm_aiter_ops:
         """
         from aiter import flash_attn_varlen_func
 
-        # AITER's soft-capped forward is only correct on its LSE-returning
-        # path; without it the cap is applied wrongly. Take that path and drop
-        # the LSE.
-        cap_needs_lse = logits_soft_cap > 0.0 and not return_lse
-        result = flash_attn_varlen_func(
+        return flash_attn_varlen_func(
             q=q,
             k=k,
             v=v,
@@ -4552,17 +4548,10 @@ class rocm_aiter_ops:
             causal=causal,
             window_size=window_size,
             alibi_slopes=alibi_slopes,
-            return_lse=return_lse or cap_needs_lse,
+            return_lse=return_lse,
             out=out,
             sink_ptr=sink_ptr,
         )
-        if not cap_needs_lse:
-            return result
-        if out is None:
-            return result[0]
-        if result[0].data_ptr() != out.data_ptr():
-            out.copy_(result[0])
-        return out
 
     @staticmethod
     def fp8_attn_wrapper(

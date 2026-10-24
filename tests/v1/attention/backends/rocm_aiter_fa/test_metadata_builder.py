@@ -263,3 +263,43 @@ def test_asm_scale_tables_only_for_fp8_shuffle(monkeypatch, kv_cache_dtype, shuf
         table = md.k_scale["target"]
         assert table.shape == (case.num_blocks, QWEN3_235B.num_kv_heads, 16)
         assert torch.all(table == case.layer._k_scale_float)
+
+
+def test_builder_ignores_layers_outside_its_group():
+    """A builder serves only its KV-cache group: a sliding-window layer in
+    another group must not give this group window tables."""
+    case = _case(shape=MUSE_SPARK_SLIDING)
+    shape = MUSE_SPARK_SLIDING
+    with set_current_vllm_config(case.config), torch.device(DEVICE):
+        Attention(
+            shape.num_heads,
+            shape.head_size,
+            case.scale,
+            shape.num_kv_heads,
+            cache_config=case.config.cache_config,
+            per_layer_sliding_window=256,
+            prefix="other_group",
+            attn_backend=AiterFlashAttentionBackend,
+        )
+        builder = AiterFlashAttentionMetadataBuilder(
+            case.builder.kv_cache_spec, ["target"], case.config, DEVICE
+        )
+    assert builder.aot_sliding_window is None
+    assert builder._swa_block_table is None
+
+
+def test_shuffle_layout_refuses_multi_token_decode(monkeypatch):
+    from types import SimpleNamespace
+
+    from tests.v1.attention.backends.rocm_aiter_fa.fa_harness import set_shuffle
+
+    case = _case()
+    set_shuffle(monkeypatch, True)
+    case.config.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    monkeypatch.setattr(
+        "vllm.v1.attention.backend.max_decode_query_len", lambda config: 4
+    )
+    with pytest.raises(ValueError, match="multi-token decode"):
+        AiterFlashAttentionMetadataBuilder(
+            case.builder.kv_cache_spec, ["target"], case.config, DEVICE
+        )

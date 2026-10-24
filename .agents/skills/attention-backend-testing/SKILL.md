@@ -27,7 +27,12 @@ Buildkite wiring and perf/accuracy comparison. When reviewing a PR, use
    (a) checks the numerical output against an independent reference and
    (b) asserts the intended kernel ran, by spying on the op (monkeypatch a
    wrapper that records the call). Output-only tests cannot tell a fallback
-   from the fast path.
+   from the fast path. Use synthetic shapes where no model reaches a branch
+   (a head-32 case for a head-below-64 fallback). Branch coverage of the
+   backend module is necessary but not enough: one branch passes features
+   (window, sinks, soft cap, ALiBi, non-causal, fp8) to its kernel as
+   arguments, so also run every declared feature through every phase
+   (prefill, extend, decode, spec decode, mixed) and check the output.
 2. **Independent reference.** Compare against a float32 PyTorch reference
    computed from the logical (unpaged, unquantized-then-dequantized) K/V, not
    against another kernel of the same library. For fp8 KV, quantize the

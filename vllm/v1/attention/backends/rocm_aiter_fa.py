@@ -16,7 +16,6 @@ from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import cdiv
-from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import (
     async_tensor_h2d,
     get_dtype_size,
@@ -45,12 +44,6 @@ _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
 if current_platform.is_rocm():
     from vllm.triton_utils import tl, triton
-
-    def block_size(x, head_dim):
-        return min(65536 // x.element_size(), triton.next_power_of_2(head_dim))
-
-    def num_programs(total_tokens):
-        return min(total_tokens, num_compute_units())
 
     @triton.jit
     def cp_mha_gather_cache_kernel(
@@ -1095,6 +1088,25 @@ class AiterFlashAttentionImpl(AttentionImpl):
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
+        # AITER's varlen forward cannot serve these features on every path:
+        # soft cap is wrong (or faults) on its LSE-free path, sinks are
+        # dropped by the head-128 asm kernel and double counted when extend
+        # merges chunk partials, and ALiBi positions restart in each context
+        # chunk. Batches with prefill or extend rows then run through
+        # unified_attention, which reads every token from the paged cache.
+        self.prefill_via_unified_attention = (
+            self.logits_soft_cap > 0
+            or self.sinks is not None
+            or self.alibi_slopes is not None
+        )
+        if self.prefill_via_unified_attention and (
+            rocm_aiter_ops.is_shuffle_kv_cache_enabled()
+        ):
+            raise NotImplementedError(
+                "ROCM_AITER_FA's shuffle KV cache layout does not support "
+                "soft cap, ALiBi or sinks; unset VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT."
+            )
+
         if attn_type != AttentionType.DECODER:
             raise NotImplementedError(
                 "Only decoder self-attention is supported for "
@@ -1224,7 +1236,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
             min_seqlen_q=min_seqlen_q,
             dropout_p=0.0,
             softmax_scale=self.scale,
-            causal=True,
+            causal=attn_metadata.causal,
             window_size=self.sliding_window,
             alibi_slopes=self.alibi_slopes,
             return_lse=True,
@@ -1381,6 +1393,15 @@ class AiterFlashAttentionImpl(AttentionImpl):
 
         num_decode_tokens = attn_metadata.num_decode_tokens
         num_extend_tokens = attn_metadata.num_extend_tokens
+        if (
+            self.prefill_via_unified_attention
+            and attn_metadata.causal
+            and (num_prefills > 0 or num_extends > 0)
+        ):
+            self._forward_unified(
+                layer, query, key_cache, value_cache, output, attn_metadata
+            )
+            return output
         if (self.kv_sharing_target_layer_name is not None or key is None) and (
             num_prefills > 0 or num_extends > 0
         ):
@@ -1725,6 +1746,56 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 )
 
         return output
+
+    def _forward_unified(
+        self,
+        layer: AttentionLayer,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: AiterFlashAttentionMetadata,
+    ) -> None:
+        """Whole batch through unified_attention over the paged cache, which
+        already holds this step's K/V."""
+        from aiter.ops.triton.unified_attention import unified_attention
+
+        num_reqs = (
+            attn_metadata.num_decodes
+            + attn_metadata.num_extends
+            + attn_metadata.num_prefills
+        )
+        num_tokens = attn_metadata.num_actual_tokens
+        max_query_len = max(
+            md.max_query_len
+            for md in (
+                attn_metadata.decode_metadata,
+                attn_metadata.extend_metadata,
+                attn_metadata.prefill_metadata,
+            )
+            if md is not None
+        )
+        k_descale, v_descale = self._get_kv_cache_descales(layer, num_reqs)
+        unified_attention(
+            q=query[:num_tokens],
+            k=key_cache,
+            v=value_cache,
+            out=output[:num_tokens],
+            cu_seqlens_q=attn_metadata.query_start_loc[: num_reqs + 1],
+            max_seqlen_q=max_query_len,
+            seqused_k=attn_metadata.seq_lens[:num_reqs],
+            max_seqlen_k=attn_metadata.max_seq_len,
+            softmax_scale=self.scale,
+            causal=True,
+            alibi_slopes=self.alibi_slopes,
+            window_size=self.sliding_window,
+            block_table=attn_metadata.block_table[:num_reqs],
+            softcap=self.logits_soft_cap,
+            q_descale=None,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            sinks=self.sinks,
+        )
 
     def _split_kv_cache(
         self, kv_cache: torch.Tensor
