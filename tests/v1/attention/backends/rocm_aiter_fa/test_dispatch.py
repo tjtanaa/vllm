@@ -208,42 +208,29 @@ def _run_row(row: Row, spy, monkeypatch, kv_cache_dtype: str = "auto"):
 
 @pytest.mark.parametrize("row", ROWS, ids=lambda r: r.id)
 @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
-def test_dispatch_row(row, kv_cache_dtype, spy, monkeypatch, request):
-    if row.id == "D6-decode-noncausal" and kv_cache_dtype == "fp8":
-        request.applymarker(
-            pytest.mark.xfail(
-                strict=True,
-                raises=ValueError,
-                reason="non-causal decode passes a bf16 query with an fp8 KV "
-                "cache to mha_v3 flash_attn_with_kvcache, which rejects mixed "
-                "FP8/non-FP8 inputs",
-            )
-        )
+def test_dispatch_row(row, kv_cache_dtype, spy, monkeypatch):
     case, batch, query, output = _run_row(row, spy, monkeypatch, kv_cache_dtype)
     assert Counter(spy.names()) == Counter(row.kernels), spy.names()
     case.check(batch, query, output)
 
 
 @pytest.mark.parametrize(
-    "query_lens, seq_lens, kernels",
+    "query_lens, seq_lens, kernels, window",
     [
-        ([1, 1], [17, 300], {PAGED_V1: 1}),
-        ([33, 64], [33, 64], {VARLEN: 1}),
-        ([40, 3], [200, 19], {VARLEN: 2, GATHER: 1, MERGE: 1}),
+        ([1, 1], [17, 300], {PAGED_V1: 1}, None),
+        ([33, 64], [33, 64], {VARLEN: 1}, None),
+        ([40, 3], [200, 19], {VARLEN: 2, GATHER: 1, MERGE: 1}, None),
+        ([40, 3], [400, 19], {VARLEN: 1, GATHER: 1}, SMALL_WINDOW),
     ],
-    ids=["decode", "prefill", "extend"],
+    ids=["decode", "prefill", "extend", "extend-swa"],
 )
-def test_logits_soft_cap_every_phase(spy, query_lens, seq_lens, kernels, request):
+def test_logits_soft_cap_every_phase(spy, query_lens, seq_lens, kernels, window):
     """Gemma-2/Grok-style attention soft cap must apply in every phase."""
-    if query_lens[0] > 1:
-        request.applymarker(
-            pytest.mark.xfail(
-                strict=True,
-                reason="prefill/extend call flash_attn_varlen_func without "
-                "logits_soft_cap, so the cap is silently dropped",
-            )
-        )
-    case = FaCase(QWEN3_235B, logits_soft_cap=5.0).setup(blocks_for(seq_lens, 16))
+    case = FaCase(
+        QWEN3_235B if window is None else MUSE_SPARK_SLIDING,
+        logits_soft_cap=5.0,
+        sliding_window=window,
+    ).setup(blocks_for(seq_lens, 16))
     batch = case.batch(query_lens, seq_lens)
     # Large logits so the cap changes the result.
     query = case.query(batch.num_tokens) * 8
@@ -345,17 +332,7 @@ def test_padded_tokens_are_not_written():
     ],
     ids=["runner-v1-order", "runner-v2-order"],
 )
-def test_batch_order_from_each_model_runner(query_lens, seq_lens, request):
-    if request.node.callspec.id == "runner-v2-order":
-        request.applymarker(
-            pytest.mark.xfail(
-                strict=True,
-                reason="split_decodes_prefills_and_extends assumes extends "
-                "precede prefills; model runner v2 sorts non-decodes by token "
-                "count, so an extend after a prefill is run as a prefill "
-                "without its context",
-            )
-        )
+def test_batch_order_from_each_model_runner(query_lens, seq_lens):
     case = FaCase(QWEN3_235B).setup(blocks_for(seq_lens, 16))
     batch = case.batch(query_lens, seq_lens)
     query = case.query(batch.num_tokens)

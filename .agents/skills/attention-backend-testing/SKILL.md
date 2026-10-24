@@ -72,13 +72,17 @@ Buildkite wiring and perf/accuracy comparison. When reviewing a PR, use
    without a sharing layer). Track peak memory of a fixed workload and fail on
    growth beyond a stated budget.
 10. **Runtime integration through a dummy-weight model.** Build a small model
-    from a real architecture (`load_format="dummy"`, few layers via
-    `hf_overrides`) and run it through `LLM` with the scheduler, prefix
-    caching, chunked prefill, async scheduling on/off, model runner v1 and v2,
-    and each CUDA graph mode. Compare prompt logprobs and sampled logprobs
-    with the same model on a reference backend; dummy weights make greedy
-    tokens unstable, so compare logprob values with a tolerance, not token
-    ids.
+    from a real architecture (`load_format="dummy"`, `hf_overrides`) and run it
+    through `LLM` with the scheduler, prefix caching, chunked prefill, async
+    scheduling on/off, model runner v1 and v2, and each CUDA graph mode. For a
+    hybrid model, keep exactly its smallest repeating layer block (Qwen3.8: 3
+    GDN + 1 full; Gemma 4: 5 sliding + 1 global; GPT-OSS: sliding + full), so
+    every layer kind and its neighbors run. Stock dummy weights give flat
+    logits, which hide broken attention: rescale matrices to 1/sqrt(fan_in),
+    give norms unit gain, make every MoE expert active (routing ties flip on
+    any numeric change), and compare teacher-forced prompt logprobs against a
+    reference backend with a tolerance calibrated on a second correct backend.
+    Keep a negative control (a deliberately wrong window must fail).
 11. **Context parallelism is either tested or rejected.** If the backend does
     not set `supports_pcp` / `supports_dcp`, add a selector test that a PCP/DCP
     config refuses it. If it does, test the LSE return path and the merge.
@@ -88,14 +92,19 @@ Buildkite wiring and perf/accuracy comparison. When reviewing a PR, use
     `benchmarks/attention_benchmarks/` with a per-backend config; CI stores the
     JSON per commit and compares PRs against their merge base (see CI and
     artifacts).
-14. **Every test runs in CI.** A test file that no Buildkite step collects on
+14. **Shard single-GPU tests.** Use `--shard-id/--num-shards` (Buildkite
+    `parallelism`) so a 1-GPU suite spreads over the node's GPUs; keep
+    multi-GPU cases (DCP/PCP) in their own step.
+15. **Every test runs in CI.** A test file that no Buildkite step collects on
     the hardware it needs is not coverage. Add the backend file and its op
     modules to the step's `source_file_dependencies`.
 
-15. **A found defect is a strict xfail, not a skip.** Mark the case
-    `xfail(strict=True, raises=<exact exception>, reason=<what is wrong>)` so
-    the suite stays green, the defect stays visible, and the fix flips it.
-16. **Build the harness like the runner does.** Create layers under the target
+16. **Fix what the suite finds.** A defect the suite exposes is fixed in the
+    same PR when it is in the backend's scope, and its test turns green. A
+    defect outside that scope (another library, a shared runner contract) is
+    a `xfail(strict=True, raises=..., reason=...)` that links an open issue,
+    so the fix flips it.
+17. **Build the harness like the runner does.** Create layers under the target
     device (model loaders do), take the KV spec dtype from the layer's
     `kv_cache_torch_dtype`, pass the spec through `customize_spec`, and view
     the cache with the same layout helpers the runner uses. Spy on kernels by

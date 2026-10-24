@@ -482,6 +482,16 @@ class AiterFlashAttentionMetadataBuilder(
         # populated on first build() call.
         self.aot_sliding_window: tuple[int, int] | None = None
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        if (
+            rocm_aiter_ops.is_shuffle_kv_cache_enabled()
+            and self.reorder_batch_threshold is not None
+            and self.reorder_batch_threshold > 1
+        ):
+            raise ValueError(
+                "ROCM_AITER_FA's shuffle KV cache layout does not support "
+                "multi-token decode (speculative decoding); unset "
+                "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT."
+            )
 
         sliding_window_configs: set[tuple[int, int] | None] = set()
         kv_sharing_shape = None
@@ -896,7 +906,6 @@ class AiterFlashAttentionBackend(AttentionBackend):
         "bfloat16",
         "fp8",
         "fp8_e4m3",
-        "fp8_e5m2",
     ]
 
     @classmethod
@@ -917,10 +926,11 @@ class AiterFlashAttentionBackend(AttentionBackend):
         return [64, 128, 256]
 
     forward_includes_kv_cache_update: bool = False
-    # External KV writers produce the packed layout, not the shuffle layout.
-    supports_kv_cache_update_bypass: bool = (
-        not rocm_aiter_ops.is_shuffle_kv_cache_enabled()
-    )
+
+    @classmethod
+    def supports_kv_update_bypass(cls) -> bool:
+        # External KV writers produce the packed layout, not the shuffle layout.
+        return not rocm_aiter_ops.is_shuffle_kv_cache_enabled()
 
     @staticmethod
     def get_name() -> str:
@@ -969,15 +979,66 @@ class AiterFlashAttentionBackend(AttentionBackend):
         )
 
     @classmethod
+    def validate_configuration(
+        cls,
+        head_size: int,
+        dtype: torch.dtype,
+        kv_cache_dtype: CacheDType | None,
+        block_size: int | None,
+        use_mla: bool,
+        has_sink: bool,
+        use_sparse: bool,
+        use_mm_prefix: bool,
+        use_per_head_quant_scales: bool,
+        device_capability: DeviceCapability,
+        attn_type: str,
+        has_sliding_window: bool = False,
+        use_non_causal: bool = False,
+        use_batch_invariant: bool = False,
+        use_kv_connector: bool = False,
+        use_pcp: bool = False,
+        use_adaptive_verification: bool = False,
+        use_dcp: bool = False,
+        use_rswa: bool = False,
+    ) -> list[str]:
+        invalid_reasons = super().validate_configuration(
+            head_size=head_size,
+            dtype=dtype,
+            kv_cache_dtype=kv_cache_dtype,
+            block_size=block_size,
+            use_mla=use_mla,
+            has_sink=has_sink,
+            use_sparse=use_sparse,
+            use_mm_prefix=use_mm_prefix,
+            use_per_head_quant_scales=use_per_head_quant_scales,
+            device_capability=device_capability,
+            attn_type=attn_type,
+            has_sliding_window=has_sliding_window,
+            use_non_causal=use_non_causal,
+            use_batch_invariant=use_batch_invariant,
+            use_kv_connector=use_kv_connector,
+            use_pcp=use_pcp,
+            use_adaptive_verification=use_adaptive_verification,
+            use_dcp=use_dcp,
+            use_rswa=use_rswa,
+        )
+        # Shuffle decode (paged_attention_common) has no window or sink input.
+        if rocm_aiter_ops.is_shuffle_kv_cache_enabled() and (
+            has_sliding_window or has_sink
+        ):
+            invalid_reasons.append(
+                "shuffle KV cache layout does not support sliding window or sinks"
+            )
+        return invalid_reasons
+
+    @classmethod
     def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
         if rocm_aiter_ops.is_shuffle_kv_cache_enabled():
             # pa_fwd_asm strides between pages by a whole dense page, so the two
             # head slots customize_spec publishes have to be separate planes
             # spanning every block: H outermost. Under LBHNC the slots alternate
-            # block by block, doubling the stride the kernel assumes. LBHNC
-            # stays listed for models whose mixed HNC shapes need a
-            # block-compact layout; those read K/V by stride instead.
-            return (KVCacheLayout.LHBNC, KVCacheLayout.LBHNC)
+            # block by block and shuffle decode cannot read them.
+            return (KVCacheLayout.LHBNC,)
         # K and V come out of the content dim as transposed views rather than
         # copies, so the head dim may sit on either side of the block dim, but
         # the layer must stay outermost.
@@ -1117,6 +1178,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
             return_lse=False,
             out=output,
             sink_ptr=self.sinks,
+            logits_soft_cap=self.logits_soft_cap,
         )
 
     def extend_forward(
@@ -1167,6 +1229,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
             alibi_slopes=self.alibi_slopes,
             return_lse=True,
             sink_ptr=self.sinks,
+            logits_soft_cap=self.logits_soft_cap,
         )
         assert attn_metadata.extend_metadata is not None
         chunk_context_metadata = attn_metadata.extend_metadata.chunk_context_metadata
@@ -1215,6 +1278,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 alibi_slopes=self.alibi_slopes,
                 return_lse=True,
                 sink_ptr=self.sinks,
+                logits_soft_cap=self.logits_soft_cap,
             )
             if chunked_output is None:
                 chunked_output = suf_out
@@ -1367,6 +1431,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 alibi_slopes=self.alibi_slopes,
                 out=output_actual_tokens[num_decode_tokens + num_extend_tokens :],
                 sink_ptr=self.sinks,
+                logits_soft_cap=self.logits_soft_cap,
             )
 
         # calculate for extends
@@ -1445,6 +1510,16 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         query.shape[1],
                         query.shape[2],
                     )
+                    q_descale = None
+                    if k_descale is not None:
+                        # mha_v3 takes all-fp8 or no-fp8 inputs: quantize q
+                        # per tensor to match the fp8 cache.
+                        fp8 = current_platform.fp8_dtype()
+                        q_scale = (
+                            decode_query.abs().amax().float() / torch.finfo(fp8).max
+                        ).clamp_(min=1e-12)
+                        decode_query = (decode_query / q_scale).to(fp8)
+                        q_descale = q_scale.expand(num_decodes, self.num_kv_heads)
                     decode_out = flash_attn_with_kvcache(
                         q=decode_query,
                         k_cache=key_cache,
@@ -1454,7 +1529,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         causal=attn_metadata.causal,
                         window_size=self.sliding_window,
                         softcap=self.logits_soft_cap,
-                        q_descale=None,
+                        q_descale=q_descale,
                         k_descale=k_descale,
                         v_descale=v_descale,
                         page_table=attn_metadata.block_table[:num_decodes],

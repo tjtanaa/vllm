@@ -21,10 +21,13 @@ from tests.v1.attention.backends.rocm_aiter_fa.fa_harness import (
 )
 from tests.v1.attention.model_shapes import MUSE_SPARK_FULL, QWEN3_235B
 from vllm.platforms import current_platform
-from vllm.v1.attention.backends.rocm_aiter_fa import cp_mha_gather_cache
+from vllm.v1.attention.backends.rocm_aiter_fa import (
+    AiterFlashAttentionBackend,
+    cp_mha_gather_cache,
+)
 from vllm.v1.kv_cache_interface import KVCacheLayout, is_quantized_kv_cache
 
-KV_DTYPES = ["auto", "bfloat16", "fp8", "fp8_e4m3", "fp8_e5m2"]
+KV_DTYPES = ["auto", "bfloat16", "fp8", "fp8_e4m3"]
 
 
 def _read_back(case: FaCase, slots: torch.Tensor):
@@ -68,16 +71,9 @@ def _read_back(case: FaCase, slots: torch.Tensor):
 @pytest.mark.parametrize("kv_cache_dtype", KV_DTYPES)
 @pytest.mark.parametrize("layout", [KVCacheLayout.LBHNC, KVCacheLayout.LHBNC])
 @pytest.mark.parametrize("shape", [QWEN3_235B, MUSE_SPARK_FULL], ids=lambda s: s.id)
-def test_write_then_read_back(shape, layout, kv_cache_dtype, shuffle, request):
-    if kv_cache_dtype == "fp8_e5m2" and not shuffle:
-        request.applymarker(
-            pytest.mark.xfail(
-                strict=True,
-                raises=RuntimeError,
-                reason="declared in supported_kv_cache_dtypes, but ROCm "
-                "reshape_and_cache_flash rejects fp8_e5m2",
-            )
-        )
+def test_write_then_read_back(shape, layout, kv_cache_dtype, shuffle):
+    if layout not in AiterFlashAttentionBackend.supported_kv_cache_layouts():
+        pytest.skip(f"{layout.name} is not listed for this layout mode")
     case = FaCase(shape, kv_cache_dtype=kv_cache_dtype, layout=layout).setup(32)
     num_slots = case.num_blocks * case.block_size
     slots = torch.randperm(num_slots, device=DEVICE)[:100]
@@ -139,27 +135,14 @@ def test_unquantized_cache_ignores_layer_kv_scales(query_lens, seq_lens):
     case.check(batch, query, case.run(batch, query))
 
 
-@pytest.mark.parametrize("layout", [KVCacheLayout.LBHNC, KVCacheLayout.LHBNC])
-def test_every_listed_layout_gives_identical_attention(layout, shuffle, request):
-    from vllm.v1.attention.backends.rocm_aiter_fa import AiterFlashAttentionBackend
-
-    preferred = AiterFlashAttentionBackend.supported_kv_cache_layouts()[0]
-    if shuffle and layout == KVCacheLayout.LBHNC:
-        request.applymarker(
-            pytest.mark.xfail(
-                strict=True,
-                raises=AssertionError,
-                reason="LBHNC is listed as a supported layout under shuffle, "
-                "but shuffle decode (paged_attention_common) asserts dense "
-                "K/V planes, which only LHBNC provides",
-            )
-        )
+def test_every_listed_layout_gives_identical_attention(shuffle):
     q_lens, s_lens = [1, 1, 40, 64], [100, 300, 200, 64]
     outputs = []
-    for lay in (preferred, layout):
-        case = FaCase(QWEN3_235B, layout=lay).setup(blocks_for(s_lens, 16))
+    for layout in AiterFlashAttentionBackend.supported_kv_cache_layouts():
+        case = FaCase(QWEN3_235B, layout=layout).setup(blocks_for(s_lens, 16))
         batch = case.batch(q_lens, s_lens)
         torch.manual_seed(1)
         query = case.query(batch.num_tokens)
         outputs.append(case.run(batch, query))
-    torch.testing.assert_close(outputs[0], outputs[1], atol=0, rtol=0)
+    for output in outputs[1:]:
+        torch.testing.assert_close(output, outputs[0], atol=0, rtol=0)

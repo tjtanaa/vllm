@@ -59,7 +59,6 @@ def test_declarations_match_flagship_model_needs():
         "bfloat16",
         "fp8",
         "fp8_e4m3",
-        "fp8_e5m2",
     }
     assert BACKEND.get_supported_kernel_block_sizes() == [16, 32]
     assert BACKEND.supports_sink()
@@ -76,7 +75,7 @@ def test_declarations_match_flagship_model_needs():
     "shape", [QWEN3_235B, QWEN3_8_27B, MUSE_SPARK_FULL], ids=lambda s: s.id
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8", "fp8_e4m3", "fp8_e5m2"])
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8", "fp8_e4m3"])
 @pytest.mark.parametrize("block_size", [16, 32])
 def test_selector_accepts_declared_combinations(
     shape, dtype, kv_cache_dtype, block_size
@@ -97,6 +96,8 @@ def test_selector_accepts_declared_combinations(
         ({"head_size": 96}, "head_size"),
         ({"dtype": torch.float32}, "dtype"),
         ({"kv_cache_dtype": "nvfp4"}, "kv_cache_dtype"),
+        # ROCm reshape_and_cache_flash cannot write it.
+        ({"kv_cache_dtype": "fp8_e5m2"}, "kv_cache_dtype"),
         ({"block_size": 8}, "block_size"),
         ({"use_mla": True}, "MLA"),
         ({"use_sparse": True}, "sparse"),
@@ -112,6 +113,19 @@ def test_selector_accepts_declared_combinations(
 def test_selector_rejects_undeclared(overrides, reason):
     with pytest.raises(ValueError, match=reason):
         _select(**overrides)
+
+
+@pytest.mark.parametrize("feature", ["has_sliding_window", "has_sink"])
+def test_shuffle_layout_rejects_window_and_sinks(feature, shuffle):
+    """Shuffle decode has no window or sink input; the selector must refuse
+    the combination instead of letting forward() assert at the first decode."""
+    if shuffle:
+        with pytest.raises(ValueError, match="shuffle KV cache layout"):
+            _select(**{feature: True})
+    else:
+        assert _select(**{feature: True}) == (
+            AttentionBackendEnum.ROCM_AITER_FA.get_path()
+        )
 
 
 def test_model_shapes_outside_head_sizes_are_rejected():
@@ -177,27 +191,21 @@ def test_customize_spec_is_idempotent_under_shuffle(shuffle):
 def test_kv_cache_layouts(shuffle):
     layouts = BACKEND.supported_kv_cache_layouts()
     if shuffle:
-        assert layouts[0] == KVCacheLayout.LHBNC
-    assert set(layouts) == {KVCacheLayout.LBHNC, KVCacheLayout.LHBNC}
+        # Shuffle decode reads K and V as separate dense planes.
+        assert layouts == (KVCacheLayout.LHBNC,)
+    else:
+        assert set(layouts) == {KVCacheLayout.LBHNC, KVCacheLayout.LHBNC}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="supports_kv_cache_update_bypass is a class attribute computed at "
-    "import, so it ignores rocm_aiter_ops.refresh_env_variables()",
-)
 def test_kv_update_bypass_follows_the_shuffle_toggle(monkeypatch):
     """External KV writers produce the packed layout, so bypass is only
-    allowed without shuffle. The flag is a class attribute evaluated at
-    import; it must still agree with the toggle after a refresh."""
+    allowed without shuffle, including after the env is refreshed."""
     try:
         for enabled in (False, True):
             monkeypatch.setenv("VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT", str(int(enabled)))
             rocm_aiter_ops.refresh_env_variables()
             assert rocm_aiter_ops.is_shuffle_kv_cache_enabled() == enabled
-            assert BACKEND.supports_kv_cache_update_bypass == (not enabled), (
-                "supports_kv_cache_update_bypass is frozen at import time"
-            )
+            assert BACKEND.supports_kv_update_bypass() == (not enabled)
     finally:
         monkeypatch.undo()
         rocm_aiter_ops.refresh_env_variables()
