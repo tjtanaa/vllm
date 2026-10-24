@@ -332,3 +332,31 @@ def test_padded_tokens_are_not_written():
     output = case.run(batch, query)
     case.check(batch, query, output)
     assert torch.isnan(output[batch.num_tokens :]).all()
+
+
+@pytest.mark.parametrize(
+    "query_lens, seq_lens",
+    [
+        # Model runner v1 order: decode, short extend, long extend, prefill.
+        ([1, 3, 40, 5], [100, 19, 200, 5]),
+        # Model runner v2 order: decodes first, then by scheduled token count,
+        # so a short prefill can precede a longer extend.
+        ([1, 3, 5, 40], [100, 19, 5, 200]),
+    ],
+    ids=["runner-v1-order", "runner-v2-order"],
+)
+def test_batch_order_from_each_model_runner(query_lens, seq_lens, request):
+    if request.node.callspec.id == "runner-v2-order":
+        request.applymarker(
+            pytest.mark.xfail(
+                strict=True,
+                reason="split_decodes_prefills_and_extends assumes extends "
+                "precede prefills; model runner v2 sorts non-decodes by token "
+                "count, so an extend after a prefill is run as a prefill "
+                "without its context",
+            )
+        )
+    case = FaCase(QWEN3_235B).setup(blocks_for(seq_lens, 16))
+    batch = case.batch(query_lens, seq_lens)
+    query = case.query(batch.num_tokens)
+    case.check(batch, query, case.run(batch, query))

@@ -26,8 +26,8 @@ once `t > KV`).
 | Gemma 4 MoE (`google/gemma-4-26B-A4B-it`) | Gemma4ForConditionalGeneration | 25 sliding + 5 global | sliding 16 / 8 / 256; global 16 / 2 / 512 | 1024 | as above | as above |
 | Muse Spark Open (`meta-models/Muse-Spark-Open-816B-A42B`) | MuseSparkForConditionalGeneration | 46 sliding + 16 full | 128 / 16 / 64 | 2048 | final logit softcap 20; fused qk-norm+rope+KV insert bypasses the KV write | yes, every layer (head 64) |
 
-The Muse Spark repo is gated; the numbers come from the public
-`mlx-community/Muse-Spark-Open-816B-A42B-4bit` conversion of the same config.
+The Muse Spark repo is gated; the numbers were checked against its own
+`config.json` with an HF token (the public mlx-community conversion matches).
 
 ## Derived test dimensions for dense MHA backends
 

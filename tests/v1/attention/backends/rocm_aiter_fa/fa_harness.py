@@ -148,7 +148,8 @@ class FaCase:
     block_size: int = 16
     sliding_window: int | None = None
     logits_soft_cap: float | None = None
-    use_sinks: bool = False
+    # None: take it from the shape (GPT-OSS layers have sinks).
+    use_sinks: bool | None = None
     use_alibi: bool = False
     kv_sharing: bool = False
     layout: KVCacheLayout | None = None
@@ -176,6 +177,8 @@ class FaCase:
 
     def setup(self, num_blocks: int) -> "FaCase":
         torch.manual_seed(self.seed)
+        if self.use_sinks is None:
+            self.use_sinks = self.shape.sinks
         self.num_blocks = num_blocks
         self.config = make_config(
             self.shape,

@@ -2,9 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """ROCM_AITER_FA through the engine: scheduler, model runners, graphs.
 
-Each run builds a two-layer model from a flagship architecture with dummy
+Each run builds a few-layer model from a flagship architecture with dummy
 weights (attention dims unchanged, everything else shrunk) and compares its
-greedy logprobs with the same model on TRITON_ATTN in eager mode. The batch
+greedy logprobs with the same model on TRITON_ATTN in eager mode. Qwen3 gives
+plain full-attention GQA; Muse Spark Open adds sliding-window layers (2048)
+next to full layers, head size 64 and the fused qk-norm+RoPE+KV insert that
+bypasses the backend's KV write. The batch
 mixes long prompts (chunked prefill -> extends), a shared prefix (prefix-cache
 hits -> extends) and decode steps, so every phase runs under each:
 
@@ -19,7 +22,11 @@ Dummy weights make greedy tokens fragile, so the comparison is
 the token in its top-k.
 """
 
+from dataclasses import dataclass, field, replace
+from functools import partial
+
 import pytest
+import torch
 
 from tests.models.utils import check_logprobs_close
 from vllm.platforms import current_platform
@@ -28,26 +35,65 @@ pytestmark = pytest.mark.skipif(
     not current_platform.is_rocm(), reason="ROCM_AITER_FA is ROCm only"
 )
 
+
+@dataclass(frozen=True)
+class DummyModel:
+    name: str
+    hf_overrides: dict
+    max_model_len: int = 2048
+    # Prompt words; above the window for sliding-window models.
+    long_words: int = 200
+    # Extra LM-head gain that makes the reference logits clearly peaked.
+    logit_gain: float = 8.0
+    engine_kwargs: dict = field(default_factory=dict)
+
+
 # Qwen3-235B-A22B attention (64 q heads, 4 KV heads, head 128); MoE shrunk.
-QWEN3 = (
+QWEN3 = DummyModel(
     "Qwen/Qwen3-235B-A22B",
     {
         "num_hidden_layers": 2,
         "hidden_size": 1024,
         "intermediate_size": 1024,
         "moe_intermediate_size": 256,
-        "num_experts": 8,
+        # Every expert active: no routing ties for a backend difference to flip.
+        "num_experts": 2,
         "num_experts_per_tok": 2,
     },
 )
+# Muse Spark Open attention (128 q heads, 16 KV heads, head 64); its first two
+# layers are sliding (window 2048) then full. MoE and vision
+# tower shrunk. Gated on Hugging Face: needs HF_TOKEN.
+MUSE_SPARK = DummyModel(
+    "meta-models/Muse-Spark-Open-816B-A42B",
+    {
+        "text_config": {
+            "num_hidden_layers": 2,
+            "num_local_experts": 2,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 512,
+            "moe_hidden_size": 512,
+            "intermediate_size": 1024,
+        },
+        "vision_config": {"num_hidden_layers": 2},
+    },
+    max_model_len=8192,
+    long_words=1400,
+    # Logits are scaled by output_multiplier (0.177) and soft-capped at 20; a
+    # larger gain saturates the cap and ties the top tokens.
+    logit_gain=20.0,
+    engine_kwargs={"limit_mm_per_prompt": {"image": 0, "video": 0, "audio": 0}},
+)
+MODELS = [pytest.param(QWEN3, id="qwen3"), pytest.param(MUSE_SPARK, id="muse_spark")]
 
 MAX_TOKENS = 24
 NUM_LOGPROBS = 5
 SHARED_PREFIX = "You are a careful assistant. Answer briefly and cite sources. " * 8
 
 
-def _prompts() -> list[str]:
-    long = " ".join(f"item{i}" for i in range(200))  # > max_num_batched_tokens
+def _prompts(model: DummyModel) -> list[str]:
+    # Longer than max_num_batched_tokens, so it prefills in chunks (extends).
+    long = " ".join(f"item{i}" for i in range(model.long_words))
     return [
         "Hello",
         SHARED_PREFIX + "What is the capital of France?",
@@ -56,6 +102,32 @@ def _prompts() -> list[str]:
         "one two three one two three one two three one two three",
         "The quick brown fox jumps over the lazy dog. " * 20,
     ]
+
+
+# Dummy weights are uniform in +-1e-3, which leaves logits almost flat (every
+# logprob near -log(vocab)), so a broken attention would still "match".
+DUMMY_HALF_RANGE = 1e-3
+
+
+def _scale_dummy_weights(model: torch.nn.Module, logit_gain: float) -> None:
+    """Give norms unit gain, rescale every matrix to std 1/sqrt(fan_in) and the
+    LM head further by ``logit_gain``, in place and identically on every
+    backend, so the logits are peaked and greedy tokens depend on what
+    attention returns."""
+    uniform_std = DUMMY_HALF_RANGE / 3**0.5
+    for name, param in model.named_parameters():
+        if param.dim() == 1 and "norm" in name:
+            param.data.fill_(1.0)
+        elif param.dim() >= 2 and param.dtype in (torch.bfloat16, torch.float16):
+            gain = logit_gain if "lm_head" in name else 1.0
+            param.data.mul_(gain * param.shape[-1] ** -0.5 / uniform_std)
+
+
+def _bypassed_kv_writes(model: torch.nn.Module) -> int:
+    """Attention layers whose KV write is done by a fused model op."""
+    return sum(
+        bool(getattr(m, "kv_cache_update_bypass", False)) for m in model.modules()
+    )
 
 
 def _run(
@@ -70,10 +142,10 @@ def _run(
     model_runner_v2=False,
     speculative=False,
 ):
-    name, overrides = model
     monkeypatch.setenv("VLLM_ROCM_USE_AITER", "1")
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1" if model_runner_v2 else "0")
-    kwargs = {}
+    kwargs = dict(model.engine_kwargs)
     if speculative:
         kwargs["speculative_config"] = {
             "method": "ngram",
@@ -83,11 +155,11 @@ def _run(
         }
     eager = cudagraph_mode == "NONE"
     with vllm_runner(
-        name,
+        model.name,
         load_format="dummy",
-        hf_overrides=overrides,
+        hf_overrides=model.hf_overrides,
         dtype="bfloat16",
-        max_model_len=2048,
+        max_model_len=model.max_model_len,
         max_num_seqs=8,
         max_num_batched_tokens=512,
         enable_chunked_prefill=True,
@@ -105,47 +177,90 @@ def _run(
         gpu_memory_utilization=0.3,
         **kwargs,
     ) as llm:
-        return llm.generate_greedy_logprobs(_prompts(), MAX_TOKENS, NUM_LOGPROBS)
+        llm.apply_model(partial(_scale_dummy_weights, logit_gain=model.logit_gain))
+        outputs = llm.generate_greedy_logprobs(
+            _prompts(model), MAX_TOKENS, NUM_LOGPROBS, num_prompt_logprobs=0
+        )
+        return outputs, llm.apply_model(_bypassed_kv_writes)[0]
 
 
-_REFERENCE: dict[str, list] = {}
+_REFERENCE: dict[tuple[str, str], list] = {}
+PROMPT_LOGPROB_TOL = {"auto": 0.15, "fp8": 0.6}
 
 
-def _reference(vllm_runner, monkeypatch, kv_cache_dtype):
-    """TRITON_ATTN, eager, runner v1: computed once per KV dtype."""
-    if kv_cache_dtype not in _REFERENCE:
-        _REFERENCE[kv_cache_dtype] = _run(
+def _mean_prompt_logprob_diff(ref: list, out: list) -> float:
+    diffs = []
+    for (*_, ref_prompt), (*_, out_prompt) in zip(ref, out):
+        for ref_lp, out_lp in zip(ref_prompt[1:], out_prompt[1:]):
+            token, logprob = next(iter(ref_lp.items()))
+            diffs.append(abs(logprob.logprob - out_lp[token].logprob))
+    return sum(diffs) / len(diffs)
+
+
+def _reference(vllm_runner, monkeypatch, model, kv_cache_dtype):
+    """TRITON_ATTN, eager, runner v1: computed once per model and KV dtype."""
+    key = (model.name, kv_cache_dtype)
+    if key not in _REFERENCE:
+        _REFERENCE[key], _ = _run(
             vllm_runner,
             monkeypatch,
             backend="TRITON_ATTN",
+            model=model,
             kv_cache_dtype=kv_cache_dtype,
         )
-    return _REFERENCE[kv_cache_dtype]
+    return _REFERENCE[key]
 
 
-def _compare(vllm_runner, monkeypatch, kv_cache_dtype="auto", **kwargs):
-    ref = _reference(vllm_runner, monkeypatch, kv_cache_dtype)
-    out = _run(
+def _compare(vllm_runner, monkeypatch, model=QWEN3, kv_cache_dtype="auto", **kwargs):
+    ref = _reference(vllm_runner, monkeypatch, model, kv_cache_dtype)
+    out, bypassed = _run(
         vllm_runner,
         monkeypatch,
         backend="ROCM_AITER_FA",
+        model=model,
         kv_cache_dtype=kv_cache_dtype,
         **kwargs,
     )
+    # The comparison only has power if the reference is far from uniform
+    # (a uniform distribution gives about -12 for these vocabularies).
+    top = [max(v.logprob for v in lp.values()) for _, _, lps, _ in ref for lp in lps]
+    assert sum(top) / len(top) > -6.0, "reference logits are nearly flat"
+    # Teacher-forced prompt logprobs cover every prefill/extend position,
+    # including those past the sliding window. Calibrated on MI355: another
+    # correct backend differs by <= 0.06 (bf16 KV) / 0.35 (fp8 KV) on average;
+    # Muse Spark with a 1024 instead of 2048 window differs by 1.1.
+    diff = _mean_prompt_logprob_diff(ref, out)
+    tol = PROMPT_LOGPROB_TOL[kv_cache_dtype]
+    assert diff <= tol, f"mean prompt logprob diff {diff:.3f} > {tol}"
     check_logprobs_close(
         outputs_0_lst=ref,
         outputs_1_lst=out,
         name_0="TRITON_ATTN",
         name_1="ROCM_AITER_FA",
     )
+    return bypassed
+
+
+def _xfail_on_runner_v2(request, model_runner_v2: bool) -> None:
+    if model_runner_v2:
+        request.applymarker(
+            pytest.mark.xfail(
+                strict=True,
+                reason="model runner v2 orders non-decode requests by token "
+                "count, but ROCM_AITER_FA assumes extends precede prefills "
+                "(see test_dispatch.py::test_batch_order_from_each_model_runner)",
+            )
+        )
 
 
 CORE = [
     # (cudagraph_mode, async_scheduling, model_runner_v2)
     ("NONE", False, False),
+    ("PIECEWISE", False, False),
+    ("FULL_DECODE_ONLY", True, False),
+    ("FULL_AND_PIECEWISE", True, False),
     ("PIECEWISE", False, True),
     ("FULL_DECODE_ONLY", True, True),
-    ("FULL_AND_PIECEWISE", True, False),
 ]
 FULL = [
     (mode, async_, v2)
@@ -156,31 +271,56 @@ FULL = [
 ]
 
 
+@pytest.mark.parametrize("model", MODELS)
 @pytest.mark.parametrize("cudagraph_mode, async_scheduling, model_runner_v2", CORE)
 def test_engine_modes(
-    vllm_runner, monkeypatch, cudagraph_mode, async_scheduling, model_runner_v2
+    vllm_runner,
+    monkeypatch,
+    request,
+    model,
+    cudagraph_mode,
+    async_scheduling,
+    model_runner_v2,
 ):
+    _xfail_on_runner_v2(request, model_runner_v2)
     _compare(
         vllm_runner,
         monkeypatch,
+        model=model,
         cudagraph_mode=cudagraph_mode,
         async_scheduling=async_scheduling,
         model_runner_v2=model_runner_v2,
     )
 
 
+@pytest.mark.parametrize("model", MODELS)
 @pytest.mark.parametrize("cudagraph_mode", ["NONE", "FULL_AND_PIECEWISE"])
-def test_fp8_kv_cache(vllm_runner, monkeypatch, cudagraph_mode):
+def test_fp8_kv_cache(vllm_runner, monkeypatch, model, cudagraph_mode):
     _compare(
-        vllm_runner, monkeypatch, kv_cache_dtype="fp8", cudagraph_mode=cudagraph_mode
+        vllm_runner,
+        monkeypatch,
+        model=model,
+        kv_cache_dtype="fp8",
+        cudagraph_mode=cudagraph_mode,
     )
+
+
+def test_muse_spark_takes_the_fused_kv_insert(vllm_runner, monkeypatch):
+    """With ROCM_AITER_FA every Muse Spark layer writes its KV cache through
+    the fused qk-norm+RoPE+KV insert; the backend then reads new tokens back
+    from the cache (the KV-sharing workspace path)."""
+    bypassed = _compare(vllm_runner, monkeypatch, model=MUSE_SPARK)
+    assert bypassed == MUSE_SPARK.hf_overrides["text_config"]["num_hidden_layers"]
 
 
 @pytest.mark.parametrize(
     "cudagraph_mode, model_runner_v2",
     [("NONE", False), ("FULL_AND_PIECEWISE", False), ("FULL_AND_PIECEWISE", True)],
 )
-def test_ngram_spec_decode(vllm_runner, monkeypatch, cudagraph_mode, model_runner_v2):
+def test_ngram_spec_decode(
+    vllm_runner, monkeypatch, request, cudagraph_mode, model_runner_v2
+):
+    _xfail_on_runner_v2(request, model_runner_v2)
     # Runner v1 has no async scheduling with n-gram drafts.
     _compare(
         vllm_runner,
@@ -192,11 +332,34 @@ def test_ngram_spec_decode(vllm_runner, monkeypatch, cudagraph_mode, model_runne
     )
 
 
+def test_check_catches_a_wrong_sliding_window(vllm_runner, monkeypatch):
+    """Negative control: the comparison must fail when attention is wrong in
+    a way only long prompts show (a 1024 window where the model has 2048)."""
+    text = {**MUSE_SPARK.hf_overrides["text_config"], "sliding_window": 1024}
+    wrong = replace(
+        MUSE_SPARK, hf_overrides={**MUSE_SPARK.hf_overrides, "text_config": text}
+    )
+    ref = _reference(vllm_runner, monkeypatch, MUSE_SPARK, "auto")
+    out, _ = _run(vllm_runner, monkeypatch, backend="ROCM_AITER_FA", model=wrong)
+    assert _mean_prompt_logprob_diff(ref, out) > PROMPT_LOGPROB_TOL["auto"]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="the selector accepts ROCM_AITER_FA with the shuffle KV layout for "
+    "sliding-window models, then the first decode asserts in forward()",
+)
+def test_shuffle_layout_with_sliding_window_model(vllm_runner, monkeypatch):
+    monkeypatch.setenv("VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT", "1")
+    _compare(vllm_runner, monkeypatch, model=MUSE_SPARK)
+
+
 @pytest.mark.slow_test
 @pytest.mark.parametrize("cudagraph_mode, async_scheduling, model_runner_v2", FULL)
 def test_engine_modes_full(
-    vllm_runner, monkeypatch, cudagraph_mode, async_scheduling, model_runner_v2
+    vllm_runner, monkeypatch, request, cudagraph_mode, async_scheduling, model_runner_v2
 ):
+    _xfail_on_runner_v2(request, model_runner_v2)
     _compare(
         vllm_runner,
         monkeypatch,
@@ -211,14 +374,13 @@ def test_context_parallel_is_rejected(vllm_runner, monkeypatch, capfd):
     """The impl declares neither PCP nor DCP; asking for DCP with this backend
     must fail backend selection at startup, not produce wrong attention."""
     monkeypatch.setenv("VLLM_ROCM_USE_AITER", "1")
-    name, overrides = QWEN3
     # One KV head so DCP passes the TP > KV-heads check and reaches selection.
     with (
         pytest.raises(Exception, match="initialization failed"),
         vllm_runner(
-            name,
+            QWEN3.name,
             load_format="dummy",
-            hf_overrides={**overrides, "num_key_value_heads": 1},
+            hf_overrides={**QWEN3.hf_overrides, "num_key_value_heads": 1},
             tensor_parallel_size=2,
             decode_context_parallel_size=2,
             attention_config={"backend": "ROCM_AITER_FA"},

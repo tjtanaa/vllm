@@ -23,10 +23,12 @@ from tests.v1.attention.model_shapes import (
     GEMMA4_31B_SLIDING,
     MUSE_SPARK_SLIDING,
     AttnShape,
+    dense_rank_shapes,
     shapes_supported_by,
 )
 
-SHAPES = shapes_supported_by([64, 128, 256])
+SUPPORTED_HEAD_SIZES = [64, 128, 256]
+SHAPES = shapes_supported_by(SUPPORTED_HEAD_SIZES)
 PHASES = ["prefill", "extend", "decode", "mixed"]
 TOKENS = [1, 2048, 4096, 8192]
 BATCHES = [1, 16, 128]
@@ -118,6 +120,18 @@ def test_covering_set(shape, phase, tokens, batch, block_size, kv_cache_dtype):
 @pytest.mark.parametrize("shape", SHAPES, ids=lambda s: s.id)
 @pytest.mark.parametrize("kv_cache_dtype", KV_DTYPES)
 def test_every_model_shape_mixed_batch(shape, kv_cache_dtype):
+    _run(shape, "mixed", 2048, 16, 16, kv_cache_dtype)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [s for s in dense_rank_shapes() if s.head_size in SUPPORTED_HEAD_SIZES],
+    ids=lambda s: s.id,
+)
+@pytest.mark.parametrize("kv_cache_dtype", KV_DTYPES)
+def test_every_deployed_rank_shape(shape, kv_cache_dtype):
+    """Per-rank shapes of every valid TP/DP/EP/PP layout on the maintainers'
+    GPU counts (model_shapes.PARALLEL_LAYOUTS)."""
     _run(shape, "mixed", 2048, 16, 16, kv_cache_dtype)
 
 

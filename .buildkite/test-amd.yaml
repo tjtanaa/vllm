@@ -2569,7 +2569,7 @@ steps:
   - pytest -v -s -m 'not slow_test' v1/attention/backends/rocm_aiter_fa
 
 - label: ":amd: (MI355) ROCM_AITER_FA Engine Runtime"
-  timeout_in_minutes: 60
+  timeout_in_minutes: 75
   mirror_hardwares: [amdexperimental, amdproduction, amdgfx950nightly, amdmi355]
   dind: false
   agent_pool: mi355_2
@@ -2588,6 +2588,7 @@ steps:
   - vllm/v1/worker
   - vllm/v1/core/sched
   - vllm/compilation
+  - vllm/models/muse_spark/amd
   - tests/v1/e2e/attention
   commands:
   - pytest -v -s -m 'not slow_test' v1/e2e/attention/test_rocm_aiter_fa_runtime.py
