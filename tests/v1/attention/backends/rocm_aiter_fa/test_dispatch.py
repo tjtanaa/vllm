@@ -224,6 +224,35 @@ def test_dispatch_row(row, kv_cache_dtype, spy, monkeypatch, request):
     case.check(batch, query, output)
 
 
+@pytest.mark.parametrize(
+    "query_lens, seq_lens, kernels",
+    [
+        ([1, 1], [17, 300], {PAGED_V1: 1}),
+        ([33, 64], [33, 64], {VARLEN: 1}),
+        ([40, 3], [200, 19], {VARLEN: 2, GATHER: 1, MERGE: 1}),
+    ],
+    ids=["decode", "prefill", "extend"],
+)
+def test_logits_soft_cap_every_phase(spy, query_lens, seq_lens, kernels, request):
+    """Gemma-2/Grok-style attention soft cap must apply in every phase."""
+    if query_lens[0] > 1:
+        request.applymarker(
+            pytest.mark.xfail(
+                strict=True,
+                reason="prefill/extend call flash_attn_varlen_func without "
+                "logits_soft_cap, so the cap is silently dropped",
+            )
+        )
+    case = FaCase(QWEN3_235B, logits_soft_cap=5.0).setup(blocks_for(seq_lens, 16))
+    batch = case.batch(query_lens, seq_lens)
+    # Large logits so the cap changes the result.
+    query = case.query(batch.num_tokens) * 8
+    spy.reset()
+    output = case.run(batch, query)
+    assert Counter(spy.names()) == Counter(kernels)
+    case.check(batch, query, output)
+
+
 def test_decode_swa_uses_trimmed_table(spy, monkeypatch):
     row = next(r for r in ROWS if r.id == "D2-decode-swa")
     case, batch, _, _ = _run_row(row, spy, monkeypatch)
