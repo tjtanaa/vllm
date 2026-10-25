@@ -345,3 +345,15 @@ def cp_rejected_layouts(models: set[str] | None = None) -> list[ParallelLayout]:
         and layout.dcp * layout.pcp > 1
         and (models is None or layout.model in models)
     ]
+
+
+# More dense-MLA models, read from their config.json on 2026-10-25. Kept apart
+# from the block above so suites can add shapes without touching it.
+# Kimi-K2 (DeepseekV3ForCausalLM with 64 heads).
+KIMI_K2 = MLAShape("moonshotai/Kimi-K2-Instruct", 64, 512, 128, 64, 128, 1536)
+# Kimi-Linear-48B-A3B (KDA + MLA hybrid, no q LoRA).
+KIMI_LINEAR = MLAShape("moonshotai/Kimi-Linear-48B-A3B-Instruct", 32, 512, 128, 64, 128)
+DEEPSEEK_V2_LITE = MLAShape("deepseek-ai/DeepSeek-V2-Lite", 16, 512, 128, 64, 128)
+# GLM-4.7-Flash (Glm4MoeLiteForCausalLM): 20 heads and wider nope/v dims.
+GLM_4_7_FLASH = MLAShape("zai-org/GLM-4.7-Flash", 20, 512, 192, 64, 256, 768)
+MLA_SHAPES.extend([KIMI_K2, KIMI_LINEAR, DEEPSEEK_V2_LITE, GLM_4_7_FLASH])

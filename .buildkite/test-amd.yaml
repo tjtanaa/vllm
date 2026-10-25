@@ -4450,6 +4450,150 @@ steps:
   - pytest -v -s tests/kernels/attention/test_rocm_aiter_mla_fp8_support.py
   - pytest -v -s tests/kernels/attention/test_rocm_aiter_mla_op_registration.py
 
+- label: ":amd: (MI355) ROCM_AITER_MLA Backend Shard %N"
+  timeout_in_minutes: 60
+  mirror_hardwares: [amdexperimental, amdproduction, amdgfx950nightly, amdmi355]
+  dind: false
+  agent_pool: mi355_1
+  parallelism: 2
+  working_dir: "/vllm-workspace/tests"
+  source_file_dependencies:
+  - vllm/v1/attention/backends/mla/rocm_aiter_mla.py
+  - vllm/v1/attention/ops/rocm_aiter_mla_merge.py
+  - vllm/v1/attention/ops/rocm_aiter_mla_prefill.py
+  - vllm/v1/attention/backends/mla/prefill/aiter_flash_attn.py
+  - vllm/v1/attention/backend.py
+  - vllm/v1/attention/backends/utils.py
+  - vllm/model_executor/layers/attention
+  - vllm/_aiter_ops.py
+  - vllm/platforms/rocm.py
+  - requirements/rocm.txt
+  - docker/Dockerfile.rocm_base
+  - tests/v1/attention/backends
+  - tests/v1/attention/model_shapes.py
+  - tests/v1/attention/utils.py
+  - tests/v1/attention/test_aiter_mla_uniform_mtp_qo_len.py
+  - tests/v1/attention/test_expand_page_indices.py
+  - tests/v1/attention/test_rocm_aiter_mla_dcp_cprr.py
+  - tests/v1/attention/test_rocm_aiter_mla_dcp_cprr_numerics.py
+  - tests/v1/attention/test_rocm_aiter_mla_dcp_verify_gfx942.py
+  - tests/v1/attention/test_rocm_aiter_mla_fp8_decode_routing.py
+  - tests/v1/attention/test_rocm_aiter_mla_mtp_split.py
+  - tests/v1/attention/test_rocm_mla_dcp_context.py
+  commands:
+  - VLLM_ROCM_USE_AITER=1 pytest -v -s -m 'not slow_test' v1/attention/backends/rocm_aiter_mla --shard-id=$$BUILDKITE_PARALLEL_JOB --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
+  # The older ROCM_AITER_MLA unit files otherwise run only on MI300, so the
+  # gfx950-only paths (Gluon, fp8 asm prefill, cprr) would never run in CI.
+  - VLLM_ROCM_USE_AITER=1 pytest -v -s v1/attention/test_aiter_mla_uniform_mtp_qo_len.py v1/attention/test_expand_page_indices.py v1/attention/test_rocm_aiter_mla_dcp_cprr.py v1/attention/test_rocm_aiter_mla_dcp_cprr_numerics.py v1/attention/test_rocm_aiter_mla_dcp_verify_gfx942.py v1/attention/test_rocm_aiter_mla_fp8_decode_routing.py v1/attention/test_rocm_aiter_mla_mtp_split.py v1/attention/test_rocm_mla_dcp_context.py --shard-id=$$BUILDKITE_PARALLEL_JOB --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
+
+- label: ":amd: (MI355) ROCM_AITER_MLA Engine Runtime Shard %N"
+  timeout_in_minutes: 90
+  mirror_hardwares: [amdexperimental, amdproduction, amdgfx950nightly, amdmi355]
+  dind: false
+  agent_pool: mi355_1
+  parallelism: 4
+  working_dir: "/vllm-workspace/tests"
+  source_file_dependencies:
+  - vllm/v1/attention/backends/mla/rocm_aiter_mla.py
+  - vllm/v1/attention/ops/rocm_aiter_mla_merge.py
+  - vllm/v1/attention/ops/rocm_aiter_mla_prefill.py
+  - vllm/v1/attention/backends/mla/prefill/aiter_flash_attn.py
+  - vllm/v1/attention/backend.py
+  - vllm/v1/attention/backends/utils.py
+  - vllm/model_executor/layers/attention
+  - vllm/_aiter_ops.py
+  - vllm/platforms/rocm.py
+  - requirements/rocm.txt
+  - docker/Dockerfile.rocm_base
+  - vllm/v1/worker
+  - vllm/v1/core/sched
+  - vllm/v1/spec_decode
+  - vllm/compilation
+  - vllm/model_executor/models/deepseek_v2.py
+  - vllm/model_executor/models/deepseek_mtp.py
+  - vllm/model_executor/models/glm4_moe_lite.py
+  - vllm/models/kimi_k3/amd
+  - tests/v1/e2e/attention
+  commands:
+  - pytest -v -s -m 'not slow_test' v1/e2e/attention/test_rocm_aiter_mla_runtime.py -k 'not decode_context_parallel' --shard-id=$$BUILDKITE_PARALLEL_JOB --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
+  # 2-GPU DCP cases run in the step below.
+
+- label: ":amd: (MI355) ROCM_AITER_MLA Decode Context Parallel"
+  timeout_in_minutes: 40
+  mirror_hardwares: [amdexperimental, amdproduction, amdgfx950nightly, amdmi355]
+  dind: false
+  agent_pool: mi355_2
+  num_gpus: 2
+  working_dir: "/vllm-workspace/tests"
+  source_file_dependencies:
+  - vllm/v1/attention/backends/mla/rocm_aiter_mla.py
+  - vllm/v1/attention/ops/rocm_aiter_mla_merge.py
+  - vllm/v1/attention/ops/rocm_aiter_mla_prefill.py
+  - vllm/v1/attention/backends/mla/prefill/aiter_flash_attn.py
+  - vllm/v1/attention/backend.py
+  - vllm/v1/attention/backends/utils.py
+  - vllm/model_executor/layers/attention
+  - vllm/_aiter_ops.py
+  - vllm/platforms/rocm.py
+  - requirements/rocm.txt
+  - docker/Dockerfile.rocm_base
+  - vllm/v1/attention/ops/dcp.py
+  - vllm/distributed
+  - vllm/v1/worker
+  - tests/v1/e2e/attention
+  commands:
+  - pytest -v -s v1/e2e/attention/test_rocm_aiter_mla_runtime.py -k decode_context_parallel
+
+- label: ":amd: (MI355) [Nightly] ROCM_AITER_MLA Full Matrix Shard %N"
+  timeout_in_minutes: 120
+  mirror_hardwares: [amdexperimental, amdproduction, amdgfx950nightly, amdmi355]
+  dind: false
+  agent_pool: mi355_1
+  parallelism: 4
+  optional: true
+  working_dir: "/vllm-workspace/tests"
+  source_file_dependencies:
+  - vllm/v1/attention/backends/mla/rocm_aiter_mla.py
+  - vllm/v1/attention/ops/rocm_aiter_mla_merge.py
+  - vllm/v1/attention/ops/rocm_aiter_mla_prefill.py
+  - vllm/v1/attention/backends/mla/prefill/aiter_flash_attn.py
+  - vllm/v1/attention/backend.py
+  - vllm/v1/attention/backends/utils.py
+  - vllm/model_executor/layers/attention
+  - vllm/_aiter_ops.py
+  - vllm/platforms/rocm.py
+  - requirements/rocm.txt
+  - docker/Dockerfile.rocm_base
+  - tests/v1/attention/backends
+  - tests/v1/e2e/attention
+  commands:
+  - VLLM_ROCM_USE_AITER=1 pytest -v -s -m slow_test v1/attention/backends/rocm_aiter_mla v1/e2e/attention/test_rocm_aiter_mla_runtime.py --shard-id=$$BUILDKITE_PARALLEL_JOB --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
+
+- label: ":amd: (MI355) ROCM_AITER_MLA Perf"
+  timeout_in_minutes: 40
+  mirror_hardwares: [amdexperimental, amdproduction, amdgfx950nightly, amdmi355]
+  dind: false
+  agent_pool: mi355_1
+  optional: true
+  working_dir: "/vllm-workspace/"
+  source_file_dependencies:
+  - vllm/v1/attention/backends/mla/rocm_aiter_mla.py
+  - vllm/v1/attention/ops/rocm_aiter_mla_merge.py
+  - vllm/v1/attention/ops/rocm_aiter_mla_prefill.py
+  - vllm/v1/attention/backends/mla/prefill/aiter_flash_attn.py
+  - vllm/v1/attention/backend.py
+  - vllm/v1/attention/backends/utils.py
+  - vllm/model_executor/layers/attention
+  - vllm/_aiter_ops.py
+  - vllm/platforms/rocm.py
+  - requirements/rocm.txt
+  - docker/Dockerfile.rocm_base
+  - benchmarks/attention_benchmarks/
+  commands:
+  - mkdir -p attn-perf
+  - for cfg in benchmarks/attention_benchmarks/configs/rocm_aiter_mla_*.yaml; do VLLM_ROCM_USE_AITER=1 python3 benchmarks/attention_benchmarks/benchmark.py --config $$cfg --output-json attn-perf/$$(basename $$cfg .yaml).json; done
+  - buildkite-agent artifact upload "attn-perf/*.json"
+
 - label: ":amd: (MI355 DPX) DeepSeek V4 Fused Kernels"
   timeout_in_minutes: 60
   mirror_hardwares: [amdexperimental, amdproduction, amdgfx950nightly, amdmi355]
