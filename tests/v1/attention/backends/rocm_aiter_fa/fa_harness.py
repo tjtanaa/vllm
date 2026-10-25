@@ -9,6 +9,7 @@ uses. ``run`` writes the batch's K/V through ``do_kv_cache_update`` and calls
 ``forward``; ``reference`` recomputes the result in float32 from logical K/V.
 """
 
+import sys
 from dataclasses import dataclass, field
 
 import torch
@@ -127,7 +128,18 @@ def watch_all_kernels(spy: KernelSpy) -> None:
     # import_module, not `import a.b.c as m`: aiter's package __init__ re-exports
     # functions under the same names as their modules.
     mha_v3 = importlib.import_module("aiter.ops.triton.attention.mha_v3")
-    unified = importlib.import_module("aiter.ops.triton.unified_attention")
+    # The backend imports unified_attention by its old path, which aiter's
+    # import shim maps to attention.unified_attention by loading the file a
+    # second time under the old name, so there are two module objects with
+    # their own function. Patch both.
+    importlib.import_module("aiter.ops.triton.unified_attention")
+    unified_modules = {
+        id(m): m
+        for m in (
+            sys.modules["aiter.ops.triton.unified_attention"],
+            importlib.import_module("aiter.ops.triton.attention.unified_attention"),
+        )
+    }.values()
 
     spy.watch(rocm_aiter_ops, "flash_attn_varlen_func", VARLEN)
     spy.watch(rocm_aiter_ops, "paged_attention_common", PAGED_COMMON)
@@ -136,7 +148,8 @@ def watch_all_kernels(spy: KernelSpy) -> None:
     spy.watch(rocm_aiter_fa, "reshape_and_cache_shuffle_triton", WRITE_SHUFFLE)
     spy.watch(torch.ops.aiter, "paged_attention_v1", PAGED_V1)
     spy.watch(torch.ops._C_cache_ops, "reshape_and_cache_flash", WRITE_FLASH)
-    spy.watch(unified, "unified_attention", UNIFIED)
+    for unified in unified_modules:
+        spy.watch(unified, "unified_attention", UNIFIED)
     spy.watch(mha_v3, "flash_attn_with_kvcache", MHA_V3)
 
 

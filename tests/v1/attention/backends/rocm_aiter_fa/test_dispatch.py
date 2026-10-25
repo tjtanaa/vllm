@@ -29,7 +29,7 @@ Dispatch table (rocm_aiter_fa.py, AiterFlashAttentionImpl.forward):
 """
 
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import pytest
 import torch
@@ -47,6 +47,7 @@ from tests.v1.attention.backends.rocm_aiter_fa.fa_harness import (
     blocks_for,
 )
 from tests.v1.attention.model_shapes import (
+    MUSE_SPARK_FULL,
     MUSE_SPARK_SLIDING,
     QWEN3_8_27B,
     QWEN3_235B,
@@ -243,6 +244,20 @@ def test_logits_soft_cap_every_phase(spy, query_lens, seq_lens, kernels, window)
     case.check(batch, query, output)
 
 
+@pytest.mark.parametrize(
+    "row", [r for r in ROWS if r.shape is QWEN3_235B], ids=lambda r: r.id
+)
+@pytest.mark.parametrize(
+    "shape", [MUSE_SPARK_FULL, QWEN3_8_27B], ids=lambda s: f"d{s.head_size}"
+)
+def test_dispatch_row_other_head_sizes(row, shape, spy, monkeypatch):
+    """The head-128 dispatch rows again at head 64 and 256."""
+    row = replace(row, shape=shape)
+    case, batch, query, output = _run_row(row, spy, monkeypatch)
+    assert Counter(spy.names()) == Counter(row.kernels), spy.names()
+    case.check(batch, query, output)
+
+
 def test_decode_swa_uses_trimmed_table(spy, monkeypatch):
     row = next(r for r in ROWS if r.id == "D2-decode-swa")
     case, batch, _, _ = _run_row(row, spy, monkeypatch)
@@ -373,14 +388,19 @@ PHASE_BATCHES = {
 }
 
 
+# One model shape per supported head size: 64, 128, 256.
+HEAD_SIZE_SHAPES = [MUSE_SPARK_FULL, QWEN3_235B, QWEN3_8_27B]
+
+
 @pytest.mark.parametrize("phase", list(PHASE_BATCHES))
 @pytest.mark.parametrize("feature", list(FEATURES))
 @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
-def test_feature_in_every_phase(feature, phase, kv_cache_dtype):
+@pytest.mark.parametrize("shape", HEAD_SIZE_SHAPES, ids=lambda s: f"d{s.head_size}")
+def test_feature_in_every_phase(shape, feature, phase, kv_cache_dtype):
     """Every attention feature the backend declares gives the right output in
-    every phase, i.e. through every kernel that phase can dispatch to."""
+    every phase, i.e. through every kernel that phase can dispatch to, for
+    every supported head size."""
     query_lens, seq_lens, threshold = PHASE_BATCHES[phase]
-    shape = MUSE_SPARK_SLIDING if "window" in feature else QWEN3_235B
     case = FaCase(shape, kv_cache_dtype=kv_cache_dtype, **FEATURES[feature]).setup(
         blocks_for(seq_lens, 16)
     )

@@ -16,7 +16,7 @@ from tests.v1.attention.backends.rocm_aiter_fa.fa_harness import (
     FaCase,
 )
 from tests.v1.attention.backends.rocm_aiter_fa.test_kv_cache import _read_back
-from tests.v1.attention.model_shapes import MUSE_SPARK_FULL, QWEN3_235B
+from tests.v1.attention.model_shapes import MUSE_SPARK_FULL, QWEN3_8_27B, QWEN3_235B
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import set_current_vllm_config
 from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -65,7 +65,9 @@ def _setup(shape, kv_cache_dtype, monkeypatch):
 
 @pytest.mark.parametrize("is_neox", [True, False])
 @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
-@pytest.mark.parametrize("shape", [QWEN3_235B, MUSE_SPARK_FULL], ids=lambda s: s.id)
+@pytest.mark.parametrize(
+    "shape", [MUSE_SPARK_FULL, QWEN3_235B, QWEN3_8_27B], ids=lambda s: s.id
+)
 def test_rope_and_kv_cache_update(shape, kv_cache_dtype, is_neox, monkeypatch):
     case, slots = _setup(shape, kv_cache_dtype, monkeypatch)
     impl = case.layer.impl
@@ -114,7 +116,9 @@ def test_rope_and_kv_cache_update(shape, kv_cache_dtype, is_neox, monkeypatch):
 
 @pytest.mark.parametrize("is_neox", [True, False])
 @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
-@pytest.mark.parametrize("shape", [QWEN3_235B, MUSE_SPARK_FULL], ids=lambda s: s.id)
+@pytest.mark.parametrize(
+    "shape", [MUSE_SPARK_FULL, QWEN3_235B, QWEN3_8_27B], ids=lambda s: s.id
+)
 def test_qk_norm_rope_kv_cache_update(shape, kv_cache_dtype, is_neox, monkeypatch):
     case, slots = _setup(shape, kv_cache_dtype, monkeypatch)
     impl = case.layer.impl

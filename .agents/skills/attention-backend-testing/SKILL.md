@@ -117,6 +117,32 @@ Buildkite wiring and perf/accuracy comparison. When reviewing a PR, use
     (`importlib.import_module`, not `import a.b.c as m`, which can return a
     re-exported function of the same name).
 
+## Nuances that make a passing test meaningless
+
+Each of these let a broken backend pass in this suite's history; check for
+them before trusting a green run.
+
+- **Flat dummy logits.** `load_format="dummy"` draws weights uniform in
+  +-1e-3, so logits are almost flat and every token's logprob is near
+  `-log(vocab)` whatever attention returns. Rescale weights (rule 10) and
+  assert the logprob spread is wide before comparing.
+- **MoE routing ties.** With dummy router weights most experts tie; any numeric
+  change flips the routing and swamps the attention difference. Make every
+  expert active.
+- **Reference under different settings.** Compare against the reference
+  backend with the same dtype, KV dtype, block size, graph mode and runner, so
+  the only variable is the attention backend.
+- **Uncalibrated tolerance.** Set the tolerance from the gap between two
+  correct backends, not by loosening until green.
+- **No negative control.** Run one deliberately wrong configuration (wrong
+  window) and assert it fails the same comparison; otherwise the tolerance may
+  accept anything.
+- **Env read in another process.** Engine tests run model code in spawned
+  workers that read `VLLM_*` at import; set env vars before the `LLM` is built
+  and do not refresh cached env in the test process.
+- **Output-only checks.** A correct output from a fallback kernel passes; spy
+  on the kernel (rule 1).
+
 ## Tiers and where they live
 
 | Tier | What | Needs GPU | Location |

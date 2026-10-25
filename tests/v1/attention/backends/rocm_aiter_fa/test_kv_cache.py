@@ -19,7 +19,7 @@ from tests.v1.attention.backends.rocm_aiter_fa.fa_harness import (
     FaCase,
     blocks_for,
 )
-from tests.v1.attention.model_shapes import MUSE_SPARK_FULL, QWEN3_235B
+from tests.v1.attention.model_shapes import MUSE_SPARK_FULL, QWEN3_8_27B, QWEN3_235B
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.rocm_aiter_fa import (
     AiterFlashAttentionBackend,
@@ -70,7 +70,9 @@ def _read_back(case: FaCase, slots: torch.Tensor):
 
 @pytest.mark.parametrize("kv_cache_dtype", KV_DTYPES)
 @pytest.mark.parametrize("layout", [KVCacheLayout.LBHNC, KVCacheLayout.LHBNC])
-@pytest.mark.parametrize("shape", [QWEN3_235B, MUSE_SPARK_FULL], ids=lambda s: s.id)
+@pytest.mark.parametrize(
+    "shape", [MUSE_SPARK_FULL, QWEN3_235B, QWEN3_8_27B], ids=lambda s: s.id
+)
 def test_write_then_read_back(shape, layout, kv_cache_dtype, shuffle):
     if layout not in AiterFlashAttentionBackend.supported_kv_cache_layouts():
         pytest.skip(f"{layout.name} is not listed for this layout mode")
