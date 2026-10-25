@@ -173,7 +173,7 @@ def _build(monkeypatch, gathered_heads, segmented_supported=True):
             decode_context_parallel_size=DCP, cp_kv_cache_interleave_size=1
         ),
         model_config=SimpleNamespace(max_model_len=16, dtype=torch.bfloat16),
-        scheduler_config=SimpleNamespace(max_num_seqs=2),
+        scheduler_config=SimpleNamespace(max_num_seqs=2, async_scheduling=False),
         cache_config=SimpleNamespace(cache_dtype="fp8_e4m3", num_gpu_blocks=None),
         compilation_config=SimpleNamespace(
             cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: False)

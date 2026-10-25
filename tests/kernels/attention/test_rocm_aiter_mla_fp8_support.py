@@ -239,14 +239,15 @@ def _aiter_mla_validate(
     )
 
 
-def test_non_causal_fp16_auto_cache_is_rejected(monkeypatch):
-    """Pinned AITER aborts fp16 Q; auto-select must fall through to Triton."""
+@pytest.mark.parametrize("use_non_causal", [False, True])
+def test_fp16_auto_cache_is_rejected(monkeypatch, use_non_causal):
+    """AITER has no fp16-query MLA decode; auto-select must fall through."""
     import torch
 
     reasons = _aiter_mla_validate(
         monkeypatch,
         dtype=torch.float16,
         kv_cache_dtype="auto",
-        use_non_causal=True,
+        use_non_causal=use_non_causal,
     )
-    assert any("non-causal fp16" in reason for reason in reasons)
+    assert "fp16 MLA decode needs an fp8 KV cache" in reasons
