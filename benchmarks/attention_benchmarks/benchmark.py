@@ -736,6 +736,8 @@ def main():
             args.profile_memory = yaml_config["profile_memory"]
         if "kv_cache_dtype" in yaml_config:
             args.kv_cache_dtype = yaml_config["kv_cache_dtype"]
+        if "num_speculative_tokens" in yaml_config:
+            args.num_speculative_tokens = yaml_config["num_speculative_tokens"]
         if "cuda_graphs" in yaml_config:
             args.cuda_graphs = yaml_config["cuda_graphs"]
         if "ncu_profile" in yaml_config:
@@ -1237,6 +1239,9 @@ def main():
                             sparse_mla_topk_pattern=sparse_mla_topk_pattern,
                             prefill_backend=prefill_backend,
                             sparse_mla_masked_mha_max_seq_len=masked_mha_max_seq_len,
+                            num_speculative_tokens=getattr(
+                                args, "num_speculative_tokens", None
+                            ),
                         )
 
                         # run_mla_benchmark needs the real backend name
