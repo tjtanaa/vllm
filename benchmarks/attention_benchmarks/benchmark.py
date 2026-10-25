@@ -1314,6 +1314,7 @@ def main():
             "kv_lora_rank": args.kv_lora_rank,
             "qk_nope_head_dim": args.qk_nope_head_dim,
             "qk_rope_head_dim": args.qk_rope_head_dim,
+            "num_speculative_tokens": getattr(args, "num_speculative_tokens", None),
         }
         all_results = run_model_parameter_sweep(
             backends,
