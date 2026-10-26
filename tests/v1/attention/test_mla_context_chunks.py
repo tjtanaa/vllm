@@ -233,6 +233,29 @@ def test_prefills_without_context_are_skipped_and_neutralized():
         assert torch.isneginf(output_lse[:, token_slice]).all()
 
 
+@pytest.mark.parametrize("seq_len_of_rows", [0, 700], ids=["pad-seq0", "kv-load"])
+def test_rows_without_queries_get_no_context(seq_len_of_rows):
+    """A row with no query tokens (CUDA graph padding at seq_len 0, or a
+    request whose KV an async connector is still loading, vllm-project/vllm#51486)
+    attends to nothing: no chunk may cover it, and it adds no empty token slice
+    that would disable the single-chunk fast path."""
+    metadata = build_chunked_context(
+        [64, seq_len_of_rows, 200, seq_len_of_rows // 2], [4, 0, 4, 0], 96
+    )
+    assert metadata is not None
+    covered = {
+        request
+        for chunk in metadata.chunks
+        for request in range(chunk.request_slice.start, chunk.request_slice.stop)
+        if chunk.seq_lens[request - chunk.request_slice.start] > 0
+    }
+    assert covered == {0, 2}
+    assert all(chunk.max_query_len > 0 for chunk in metadata.chunks)
+    assert metadata.empty_token_slices == []
+    assert metadata.context_lens.tolist() == [64, 0, 200, 0]
+    assert build_chunked_context([0, seq_len_of_rows], [4, 0], 96) is None
+
+
 def test_no_context_needs_no_chunks():
     assert build_chunked_context([0, 0], [4, 4], 1024) is None
 

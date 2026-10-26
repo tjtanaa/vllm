@@ -2067,7 +2067,15 @@ def build_mla_chunked_context_metadata(
     """
     # NOTE: it is recommended you read the `Chunked Prefill` section in the
     # comment at the top of the file before trying to understand this code.
-    context_lens = context_lens_cpu.tolist()
+    query_start_loc = prefill_query_start_loc_cpu.tolist()
+    # A row with no query tokens (a CUDA graph padding request, or a request
+    # whose KV an async connector is still loading) attends to nothing, so it
+    # needs no context. Planning its context would hand the prefill kernel a
+    # chunk with no queries.
+    context_lens = [
+        context_len if query_start_loc[i + 1] > query_start_loc[i] else 0
+        for i, context_len in enumerate(context_lens_cpu.tolist())
+    ]
     if max(context_lens, default=0) <= 0:
         return None
 
@@ -2105,17 +2113,19 @@ def build_mla_chunked_context_metadata(
         padded_rows,
     )
 
-    query_start_loc = prefill_query_start_loc_cpu.tolist()
     empty_token_slices = [
         slice(query_start_loc[i], query_start_loc[i + 1])
         for i, context_len in enumerate(context_lens)
-        if context_len == 0
+        if context_len == 0 and query_start_loc[i + 1] > query_start_loc[i]
     ]
 
     use_dcp = dcp_world_size > 1
     local_context_lens_allranks = (
         get_dcp_local_seq_lens(
-            context_lens_cpu, dcp_world_size, None, dcp_local_block_size
+            torch.tensor(context_lens, dtype=context_lens_cpu.dtype),
+            dcp_world_size,
+            None,
+            dcp_local_block_size,
         ).tolist()
         if use_dcp
         else None
