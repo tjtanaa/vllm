@@ -166,6 +166,10 @@ def _builder(
         _mla_kv_dtype=torch.bfloat16,
         decode_attn_out_dtype=torch.bfloat16,
         _decode_causal=decode_causal,
+        # build() stashes the host-side lengths before calling _build_decode.
+        _seq_lens_cpu_upper_bound=None,
+        _async_scheduling=False,
+        _pad_fp8_qlen2=False,
         # Default off so existing cases keep exercising segmented/persistent.
         # Pass asm_dcp_verify=True for the CPRR route and its qlen-floor fallback.
         _asm_dcp_verify=asm_dcp_verify,
@@ -217,7 +221,7 @@ def test_build_hands_common_causal_flag_to_aiter_builder(monkeypatch, causal):
     builder = object.__new__(AiterMLAMetadataBuilder)
     builder._fp8_prefill_enabled = False
 
-    builder.build(0, SimpleNamespace(causal=causal))
+    builder.build(0, SimpleNamespace(causal=causal, seq_lens_cpu_upper_bound=None))
 
     assert seen == [causal]
 
@@ -511,6 +515,7 @@ def test_non_causal_dcp_block_bypasses_cprr_in_forward(monkeypatch):
         paged_kv_last_page_len=torch.ones(1, dtype=torch.int32),
         use_gluon_decode=False,
         use_gluon_verify=False,
+        fp8_qlen2_padded=False,
         dcp_route=rocm_aiter_mla._DCPDecodeRoute.PLAIN,
         dcp_verify=None,
         g_kv_indptr=None,
@@ -575,6 +580,7 @@ def test_single_token_dcp_decode_returns_unpadded_lse(monkeypatch):
         paged_kv_last_page_len=torch.ones(num_tokens, dtype=torch.int32),
         use_gluon_decode=False,
         use_gluon_verify=False,
+        fp8_qlen2_padded=False,
         dcp_route=rocm_aiter_mla._DCPDecodeRoute.PLAIN,
         dcp_verify=None,
         has_persistent_metadata=False,
@@ -802,6 +808,7 @@ def test_segmented_dcp_verify_matches_causal_attention(monkeypatch):
             ),
             use_gluon_decode=False,
             use_gluon_verify=False,
+            fp8_qlen2_padded=False,
             dcp_route=rocm_aiter_mla._DCPDecodeRoute.SEGMENTED,
             dcp_verify=view,
             attn_out_dtype=torch.bfloat16,
@@ -952,7 +959,7 @@ def test_builder_init_sizes_decode_metadata_and_filters_dcp_maps(
             dtype=torch.bfloat16,
             get_num_attention_heads=lambda parallel_config: num_heads,
         ),
-        scheduler_config=SimpleNamespace(max_num_seqs=2),
+        scheduler_config=SimpleNamespace(max_num_seqs=2, async_scheduling=False),
         cache_config=SimpleNamespace(cache_dtype="fp8_e4m3", num_gpu_blocks=None),
         compilation_config=SimpleNamespace(
             cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: False),
@@ -1007,7 +1014,9 @@ def test_builder_init_sizes_decode_metadata_and_filters_dcp_maps(
         ),
     )
     for _ in range(2):
-        metadata = builder.build(0, SimpleNamespace(causal=True))
+        metadata = builder.build(
+            0, SimpleNamespace(causal=True, seq_lens_cpu_upper_bound=None)
+        )
         assert metadata.dcp_context_row_indices == ([rows] if needs_row_map else None)
     assert build_rows.call_args_list == (
         [mock.call(chunk, torch.device("cpu"))] * 2 if needs_row_map else []
@@ -1071,13 +1080,16 @@ def test_min_kv_seq_len_ignores_cudagraph_padding_rows(monkeypatch):
         [0, mtp_qlen] + [mtp_qlen] * (num_reqs - 1), dtype=torch.int32
     )
 
+    builder = _builder(
+        mtp_decode_qlen=mtp_qlen,
+        has_full_cudagraphs=True,
+        max_decode_rows=num_reqs,
+        num_heads=12,
+    )
+    # The bound is read from the host-side lengths, so no GPU sync.
+    builder._seq_lens_cpu_upper_bound = seq_lens
     metadata = AiterMLAMetadataBuilder._build_decode(
-        _builder(
-            mtp_decode_qlen=mtp_qlen,
-            has_full_cudagraphs=True,
-            max_decode_rows=num_reqs,
-            num_heads=12,
-        ),
+        builder,
         block_table_tensor=torch.zeros(num_reqs, active_seq_len, dtype=torch.int32),
         seq_lens_device=seq_lens,
         max_seq_len=active_seq_len,
@@ -1089,6 +1101,21 @@ def test_min_kv_seq_len_ignores_cudagraph_padding_rows(monkeypatch):
     )
 
     assert metadata.min_kv_seq_len == active_seq_len
+
+    # Async scheduling: the host lengths assume every draft was accepted.
+    builder._async_scheduling = True
+    metadata = AiterMLAMetadataBuilder._build_decode(
+        builder,
+        block_table_tensor=torch.zeros(num_reqs, active_seq_len, dtype=torch.int32),
+        seq_lens_device=seq_lens,
+        max_seq_len=active_seq_len,
+        query_start_loc_cpu=query_start_loc,
+        query_start_loc_device=query_start_loc,
+        num_decode_tokens=num_reqs * mtp_qlen,
+        max_query_len=mtp_qlen,
+        dcp_tot_seq_lens_device=None,
+    )
+    assert metadata.min_kv_seq_len == active_seq_len - (mtp_qlen - 1)
 
 
 def test_full_cudagraph_padded_uniform_mtp_synthesizes_decode_indptr(

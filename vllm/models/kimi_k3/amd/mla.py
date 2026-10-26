@@ -58,6 +58,11 @@ class KimiK3MultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         # KV inputs/slots before the standalone write, which this path bypasses.
         if attn.impl.dcp_world_size > 1 or attn.use_pcp:
             return False
+        # The fused query is padded to AITER's head counts and _fused_decode
+        # expects a bf16 decode output; another backend (TRITON_MLA with an
+        # fp8 cache returns fp8) must take the layer's own forward.
+        if attn.attn_backend.get_name() != "ROCM_AITER_MLA":
+            return False
         if attn.hisparse_cache is not None or attn.q_pad_num_heads is not None:
             return False
         # Only the W_UK variants reproduced in _fused_decode are supported.

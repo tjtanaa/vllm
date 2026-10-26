@@ -600,7 +600,7 @@ def test_mla_backend_selection(
             with pytest.raises(ValueError):
                 attn_selector_config = AttentionSelectorConfig(
                     head_size=128,
-                    dtype=torch.float16,
+                    dtype=torch.bfloat16,
                     kv_cache_dtype="auto",
                     block_size=block_size,
                     use_mla=True,
@@ -610,7 +610,7 @@ def test_mla_backend_selection(
                 )
                 attn_selector_config = AttentionSelectorConfig(
                     head_size=128,
-                    dtype=torch.float16,
+                    dtype=torch.bfloat16,
                     kv_cache_dtype="auto",
                     block_size=block_size,
                     use_mla=True,
@@ -626,7 +626,7 @@ def test_mla_backend_selection(
         else:
             attn_selector_config = AttentionSelectorConfig(
                 head_size=128,
-                dtype=torch.float16,
+                dtype=torch.bfloat16,
                 kv_cache_dtype="auto",
                 block_size=block_size,
                 use_mla=True,
