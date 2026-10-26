@@ -30,6 +30,7 @@ from vllm.config import (
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
+    SpeculativeConfig,
     VllmConfig,
     set_current_vllm_config,
 )
@@ -122,6 +123,7 @@ def create_minimal_vllm_config(
     prefill_backend: str | None = None,
     kv_cache_dtype: str = "auto",
     sparse_mla_force_mqa: bool = False,
+    num_speculative_tokens: int | None = None,
 ) -> VllmConfig:
     """Create minimal VllmConfig for MLA benchmarks.
 
@@ -142,6 +144,8 @@ def create_minimal_vllm_config(
         kv_cache_dtype: KV cache dtype, e.g. "auto" or "fp8"
         sparse_mla_force_mqa: If True, forces all sparse MLA tokens through
                     forward_mqa (even prefill tokens).
+        num_speculative_tokens: If set, configure k-token drafts so the
+                    builders size their decode path for (k + 1)-token verify.
 
     Returns:
         VllmConfig for benchmarking
@@ -251,6 +255,11 @@ def create_minimal_vllm_config(
 
     if sparse_mla_force_mqa:
         vllm_config.attention_config.sparse_mla_force_mqa = True
+
+    if num_speculative_tokens:
+        vllm_config.speculative_config = SpeculativeConfig(
+            method="ngram", num_speculative_tokens=num_speculative_tokens
+        )
 
     return vllm_config
 
@@ -664,6 +673,14 @@ def _create_backend_impl(
 
     # Create mock layer
     layer = MockLayer(device, impl=impl, kv_cache_spec=kv_cache_spec)
+    # MLACommonMetadataBuilder reads the latent dims and the non-causal flag
+    # from the registered layer, as MLAAttention exposes them.
+    layer.q_lora_rank = None
+    layer.kv_lora_rank = mla_dims["kv_lora_rank"]
+    layer.qk_nope_head_dim = mla_dims["qk_nope_head_dim"]
+    layer.qk_rope_head_dim = mla_dims["qk_rope_head_dim"]
+    layer.v_head_dim = mla_dims["v_head_dim"]
+    layer.non_causal_multi_token_decode = False
 
     # Attach a prefill backend (MLAAttention does this in __init__; the metadata
     # builder reads layer.prefill_backend from static_forward_context).
@@ -1129,6 +1146,7 @@ def _run_mla_benchmark_batched(
         prefill_backend=prefill_backend,
         kv_cache_dtype=kv_cache_dtype,
         sparse_mla_force_mqa=sparse_mla_force_mqa,
+        num_speculative_tokens=getattr(first_config, "num_speculative_tokens", None),
     )
 
     results = []
