@@ -497,13 +497,15 @@ def _adaptive_varlen_verify_enabled(vllm_config: VllmConfig) -> bool:
 
 class AiterMLABackend(MLACommonBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
+    # No fp8_e5m2: ROCm's concat_and_cache_mla only writes e4m3, and the
+    # decode kernels read the cache as the platform's e4m3 format. No float16:
+    # neither the asm decode nor Gluon has an fp16 kernel (see
+    # validate_configuration).
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
-        "float16",
         "bfloat16",
         "fp8",
         "fp8_e4m3",
-        "fp8_e5m2",
     ]
 
     @classmethod
@@ -577,15 +579,14 @@ class AiterMLABackend(MLACommonBackend):
             use_dcp=use_dcp,
             use_rswa=use_rswa,
         )
-        # Arch/signature cannot express this: the backend still advertises
-        # fp16, so a DSpark draft with kv_cache_dtype="auto" would select
-        # AITER and abort on fp16 query. Causal fp16 is fine.
-        if (
-            use_non_causal
-            and dtype == torch.float16
-            and kv_cache_dtype in (None, "auto", "float16")
+        # fp16 is declared because an fp16 model with an fp8 cache decodes on
+        # fp8 queries. With an unquantized cache the decode query stays fp16,
+        # which the asm decode ("unsupport Q dtype:fp16") and Gluon (bf16/fp8
+        # KV only) both refuse at the first decode, causal or not.
+        if dtype == torch.float16 and not is_quantized_kv_cache(
+            kv_cache_dtype or "auto"
         ):
-            invalid_reasons.append("non-causal fp16 MLA decode not supported")
+            invalid_reasons.append("fp16 MLA decode needs an fp8 KV cache")
         return invalid_reasons
 
     @staticmethod
@@ -845,7 +846,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                 device
             ).multi_processor_count
 
-        # Use the group's original format: decode normalizes E5M2 to "fp8".
+        # Use the group's original format: decode normalizes fp8_e4m3 to "fp8".
         kv_cache_dtype = getattr(kv_cache_spec, "cache_dtype_str", None)
         if kv_cache_dtype is None:
             kv_cache_dtype = vllm_config.cache_config.cache_dtype
@@ -958,7 +959,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         if self._asm_dcp_verify:
             self._num_attention_heads = self._asm_dcp_verify_heads
         kv_cache_dtype_str = getattr(vllm_config.cache_config, "cache_dtype", "auto")
-        if kv_cache_dtype_str in ("fp8", "fp8_e4m3", "fp8_e5m2"):
+        if kv_cache_dtype_str in ("fp8", "fp8_e4m3"):
             kv_cache_dtype_str = "fp8"
             kv_dtype = dtypes.fp8
         else:

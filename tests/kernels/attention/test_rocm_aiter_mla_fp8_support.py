@@ -239,14 +239,42 @@ def _aiter_mla_validate(
     )
 
 
-def test_non_causal_fp16_auto_cache_is_rejected(monkeypatch):
-    """Pinned AITER aborts fp16 Q; auto-select must fall through to Triton."""
+@pytest.mark.parametrize("use_non_causal", [False, True])
+def test_fp16_auto_cache_is_rejected(monkeypatch, use_non_causal):
+    """AITER has no fp16-query MLA decode; auto-select must fall through."""
     import torch
 
     reasons = _aiter_mla_validate(
         monkeypatch,
         dtype=torch.float16,
         kv_cache_dtype="auto",
-        use_non_causal=True,
+        use_non_causal=use_non_causal,
     )
-    assert any("non-causal fp16" in reason for reason in reasons)
+    assert "fp16 MLA decode needs an fp8 KV cache" in reasons
+
+
+@pytest.mark.parametrize("kv_cache_dtype", ["fp8_e5m2", "float16"])
+def test_unservable_kv_cache_dtypes_are_rejected(monkeypatch, kv_cache_dtype):
+    """ROCm's concat_and_cache_mla cannot write an e5m2 cache (the first KV
+    write raised), and no decode kernel reads an fp16 cache."""
+    import torch
+
+    reasons = _aiter_mla_validate(
+        monkeypatch,
+        dtype=torch.bfloat16,
+        kv_cache_dtype=kv_cache_dtype,
+        use_non_causal=False,
+    )
+    assert any("kv_cache_dtype" in reason for reason in reasons), reasons
+
+
+def test_fp16_model_with_fp8_cache_is_accepted(monkeypatch):
+    """fp16 models decode on fp8 queries when the cache is fp8."""
+    import torch
+
+    assert not _aiter_mla_validate(
+        monkeypatch,
+        dtype=torch.float16,
+        kv_cache_dtype="fp8",
+        use_non_causal=False,
+    )
