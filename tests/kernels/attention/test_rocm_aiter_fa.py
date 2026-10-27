@@ -838,6 +838,233 @@ def test_aiter_fa_shared_kv_matches_reference(
         )
 
 
+def _softcap_sinks_alibi_reference(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    query_lens: list[int],
+    seq_lens: list[int],
+    slots: list[torch.Tensor],
+    scale: float,
+    *,
+    causal: bool = True,
+    soft_cap: float = 0.0,
+    sinks: torch.Tensor | None = None,
+    alibi_slopes: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Float32 attention of each request over the K/V at its cache slots."""
+    out = torch.empty(query.shape, dtype=torch.float32)
+    start = 0
+    for q_len, seq_len, req_slots in zip(query_lens, seq_lens, slots):
+        q = query[start : start + q_len].float()
+        k = key[req_slots].float()
+        v = value[req_slots].float()
+        group = q.shape[1] // k.shape[1]
+        k = k.repeat_interleave(group, dim=1)
+        v = v.repeat_interleave(group, dim=1)
+        logits = torch.einsum("qhd,khd->hqk", q, k) * scale
+        if soft_cap:
+            logits = soft_cap * torch.tanh(logits / soft_cap)
+        rel = (
+            torch.arange(seq_len)[None, :]
+            - torch.arange(seq_len - q_len, seq_len)[:, None]
+        )
+        if alibi_slopes is not None:
+            logits = logits + alibi_slopes.float()[:, None, None] * rel[None]
+        if causal:
+            logits = logits.masked_fill(rel[None] > 0, float("-inf"))
+        if sinks is not None:
+            sink_col = sinks.float()[:, None, None].expand(-1, q_len, 1)
+            probs = torch.softmax(torch.cat([logits, sink_col], dim=-1), -1)[..., :-1]
+        else:
+            probs = torch.softmax(logits, dim=-1)
+        out[start : start + q_len] = torch.einsum("hqk,khd->qhd", probs, v)
+        start += q_len
+    return out
+
+
+def _softcap_sinks_alibi_run(
+    query_lens: list[int],
+    seq_lens: list[int],
+    *,
+    head_size: int = 128,
+    kv_cache_dtype: str = "auto",
+    causal: bool = True,
+    soft_cap: float | None = None,
+    use_sinks: bool = False,
+    use_alibi: bool = False,
+    padded_tokens: int = 0,
+    query_gain: float = 1.0,
+    decode_threshold: int = 1,
+):
+    """Forward one ROCM_AITER_FA layer over a paged batch.
+
+    Returns (output, reference, metadata). Every request gets its own blocks;
+    ``padded_tokens`` extra Q/output rows (NaN) follow the real tokens, as
+    the runner pads them.
+    """
+    import dataclasses
+
+    from tests.v1.attention.utils import (
+        BatchSpec,
+        create_common_attn_metadata,
+        create_standard_kv_cache_spec,
+        create_vllm_config,
+    )
+    from vllm.config import ModelConfig, set_current_vllm_config
+    from vllm.model_executor.layers.attention import Attention
+    from vllm.v1.attention.backends.rocm_aiter_fa import (
+        AiterFlashAttentionBackend,
+        AiterFlashAttentionMetadataBuilder,
+    )
+
+    _assert_aiter_supported()
+    set_random_seed(0)
+    num_heads, num_kv_heads = 16, 4
+    config = create_vllm_config(
+        model_name="Qwen/Qwen3-0.6B",
+        dtype="bfloat16",
+        max_model_len=4096,
+        max_num_batched_tokens=1024,
+    )
+    # hf_overrides, not a post-init hf_config update: the builder sizes its
+    # extend workspace from the model config's head size and KV heads.
+    config.model_config = ModelConfig(
+        model="Qwen/Qwen3-0.6B",
+        tokenizer="Qwen/Qwen3-0.6B",
+        dtype="bfloat16",
+        seed=0,
+        max_model_len=4096,
+        hf_overrides={
+            "head_dim": head_size,
+            "num_attention_heads": num_heads,
+            "num_key_value_heads": num_kv_heads,
+        },
+    )
+    config.cache_config.cache_dtype = kv_cache_dtype
+    batch = BatchSpec(seq_lens=seq_lens, query_lens=query_lens)
+    common = create_common_attn_metadata(
+        batch, BLOCK_SIZE, torch.device("cuda"), arange_block_indices=True
+    )
+    common = dataclasses.replace(common, causal=causal)
+    num_blocks = common.block_table_tensor.numel()
+    scale = head_size**-0.5
+    extra = {}
+    if use_sinks:
+        extra["sinks"] = torch.randn(num_heads, dtype=torch.float32)
+    alibi = (
+        [2 ** (-8 * (i + 1) / num_heads) for i in range(num_heads)]
+        if use_alibi
+        else None
+    )
+    with set_current_vllm_config(config):
+        layer = Attention(
+            num_heads,
+            head_size,
+            scale,
+            num_kv_heads,
+            alibi_slopes=alibi,
+            cache_config=config.cache_config,
+            logits_soft_cap=soft_cap,
+            prefix="layer",
+            attn_backend=AiterFlashAttentionBackend,
+            **extra,
+        )
+        builder = AiterFlashAttentionMetadataBuilder(
+            create_standard_kv_cache_spec(config),
+            ["layer"],
+            config,
+            torch.device("cuda"),
+        )
+        # > 1 makes multi-token requests decodes, as spec decode does.
+        builder.reorder_batch_threshold = decode_threshold
+        with torch.device("cpu"):
+            metadata = builder.build(0, common)
+    cache_dtype = (
+        current_platform.fp8_dtype() if kv_cache_dtype == "fp8" else torch.bfloat16
+    )
+    kv_cache = torch.zeros(
+        num_blocks, num_kv_heads, BLOCK_SIZE, 2 * head_size, dtype=cache_dtype
+    )
+    layer.kv_cache = kv_cache
+    num_slots = num_blocks * BLOCK_SIZE
+    key = torch.randn(num_slots, num_kv_heads, head_size, dtype=torch.bfloat16)
+    value = torch.randn_like(key)
+    if kv_cache_dtype == "fp8":
+        # Store values fp8 represents exactly, so only kernel error remains.
+        key = key.to(cache_dtype).to(key.dtype)
+        value = value.to(cache_dtype).to(value.dtype)
+    layer.impl.do_kv_cache_update(
+        layer, key, value, kv_cache, torch.arange(num_slots, dtype=torch.int64)
+    )
+    with torch.device("cpu"):
+        table = common.block_table_tensor.cpu().long()
+        slots = []
+        for i, seq_len in enumerate(seq_lens):
+            pos = torch.arange(seq_len)
+            slots.append(table[i, pos // BLOCK_SIZE] * BLOCK_SIZE + pos % BLOCK_SIZE)
+        new_slots = torch.cat(
+            [sl[s - q :] for sl, q, s in zip(slots, query_lens, seq_lens)]
+        ).cuda()
+    num_tokens = sum(query_lens)
+    num_rows = num_tokens + padded_tokens
+    query = query_gain * torch.randn(
+        num_rows, num_heads, head_size, dtype=torch.bfloat16
+    )
+    new_key = torch.zeros(num_rows, num_kv_heads, head_size, dtype=torch.bfloat16)
+    new_value = torch.zeros_like(new_key)
+    new_key[:num_tokens] = key[new_slots]
+    new_value[:num_tokens] = value[new_slots]
+    output = torch.full_like(query, float("nan"))
+    layer.impl.forward(layer, query, new_key, new_value, kv_cache, metadata, output)
+    with torch.device("cpu"):
+        expected = _softcap_sinks_alibi_reference(
+            query[:num_tokens].cpu(),
+            key.cpu(),
+            value.cpu(),
+            query_lens,
+            seq_lens,
+            slots,
+            scale,
+            causal=causal,
+            soft_cap=soft_cap or 0.0,
+            sinks=layer.impl.sinks.cpu() if use_sinks else None,
+            alibi_slopes=layer.impl.alibi_slopes.cpu() if use_alibi else None,
+        )
+    return output, expected, metadata
+
+
+@pytest.mark.skipif(not on_mi3xx(), reason="MI300/MI350 ROCm only")
+@pytest.mark.parametrize("head_size", [64, 128])
+@pytest.mark.parametrize("feature", ["soft_cap", "sinks", "alibi"])
+@pytest.mark.parametrize("batch", ["prefill", "extend", "mixed"])
+def test_aiter_fa_prefill_extend_apply_soft_cap_sinks_alibi(
+    monkeypatch, head_size, feature, batch
+):
+    """Soft cap, sinks and ALiBi hold in prefill and in extends whose context
+    spans several chunks, not only in decode."""
+    from vllm.v1.attention.backends import rocm_aiter_fa
+
+    # 64-token context chunks, so the extend contexts below span several.
+    monkeypatch.setattr(rocm_aiter_fa, "_CP_TOKENS_PER_ITER_ROCM", 64)
+    query_lens, seq_lens = {
+        "prefill": ([32, 24], [32, 24]),
+        "extend": ([32, 24], [200, 90]),
+        "mixed": ([1, 32, 24], [100, 200, 24]),
+    }[batch]
+    output, expected, metadata = _softcap_sinks_alibi_run(
+        query_lens,
+        seq_lens,
+        head_size=head_size,
+        # A cap the logits exceed, so a dropped cap shows.
+        soft_cap=2.0 if feature == "soft_cap" else None,
+        use_sinks=feature == "sinks",
+        use_alibi=feature == "alibi",
+        query_gain=4.0 if feature == "soft_cap" else 1.0,
+    )
+    torch.testing.assert_close(output.float().cpu(), expected, atol=2e-2, rtol=2e-2)
+
+
 # Decode path test --------------------------------------------------------
 @pytest.mark.skipif(not on_mi3xx(), reason="MI300/MI350 ROCm only")
 @pytest.mark.parametrize(
