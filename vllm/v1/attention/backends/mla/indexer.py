@@ -1503,6 +1503,17 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             prefill_query_lens_cpu = torch.diff(
                 query_start_loc_cpu[num_decodes : num_decodes + num_prefills + 1]
             )
+            # A prefill row without query tokens (a request whose KV an async
+            # connector is still loading, vllm-project/vllm#51486) reads no K:
+            # give it no context, so its K is not gathered and it never forms
+            # a chunk of its own.
+            if bool((prefill_query_lens_cpu == 0).any()):
+                end = num_decodes + num_prefills
+                has_queries = query_start_loc[1 : end + 1] > query_start_loc[:end]
+                compressed_seq_lens = compressed_seq_lens.clone()
+                compressed_seq_lens[:end] *= has_queries
+                compressed_seq_lens_cpu = compressed_seq_lens_cpu.clone()
+                compressed_seq_lens_cpu[num_decodes:end] *= prefill_query_lens_cpu > 0
             max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
             # Upper bound is exact for prefill rows (the `[num_decodes:]`
             # slice below).
