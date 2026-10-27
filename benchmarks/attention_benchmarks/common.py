@@ -299,6 +299,9 @@ class BenchmarkConfig:
     # Backend-specific tuning
     num_kv_splits: int | None = None  # CUTLASS MLA
     reorder_batch_threshold: int | None = None  # FlashAttn MLA, FlashMLA
+    # MLA: build the metadata builder for k-token drafts, so verify blocks of
+    # up to k + 1 tokens take the decode kernels as they do when serving.
+    num_speculative_tokens: int | None = None
     sparse_mla_force_mqa: bool = False  # Force MQA path for sparse MLA
     sparse_mla_mha_mode: str = "auto"  # "auto", "dense", or "masked"
     sparse_mla_dense_mha_max_seq_len: int | None = None

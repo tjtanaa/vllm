@@ -2623,10 +2623,13 @@ steps:
   source_file_dependencies:
   - benchmarks/attention_benchmarks/
   - vllm/v1/attention/
+  - vllm/model_executor/layers/attention/
   - vllm/_aiter_ops.py
   - vllm/platforms/rocm.py
   commands:
   - python3 benchmarks/attention_benchmarks/benchmark.py --backends ROCM_ATTN ROCM_AITER_FA ROCM_AITER_UNIFIED_ATTN --batch-specs "8q1s1k"
+  - python3 benchmarks/attention_benchmarks/benchmark.py --backends TRITON_MLA ROCM_AITER_MLA --batch-specs "8q1s1k" "q4k"
+  - python3 benchmarks/attention_benchmarks/benchmark.py --backends ROCM_AITER_MLA_SPARSE --batch-specs "8q1s4k" "q4k" "q1ks4k"
 
 #----------------------------------------------------------  mi355 · compile  ----------------------------------------------------------#
 
