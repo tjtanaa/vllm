@@ -298,7 +298,6 @@ def test_aiter_mha_backend_contract():
         "bfloat16",
         "fp8",
         "fp8_e4m3",
-        "fp8_e5m2",
     ]
     assert AiterFlashAttentionBackend.get_supported_kernel_block_sizes() == [16, 32]
     assert AiterFlashAttentionBackend.get_supported_head_sizes() == [64, 128, 256]
@@ -307,6 +306,29 @@ def test_aiter_mha_backend_contract():
     assert not AiterFlashAttentionBackend.supports_attn_type(
         AttentionType.ENCODER_DECODER
     )
+
+
+def test_aiter_mha_backend_rejects_fp8_e5m2_kv_cache():
+    """The ROCm KV write (reshape_and_cache_flash) refuses fp8_e5m2, so the
+    selector must reject it with a reason instead of failing at the first
+    KV write."""
+    from vllm.v1.attention.backend import AttentionType
+    from vllm.v1.attention.backends.rocm_aiter_fa import AiterFlashAttentionBackend
+
+    reasons = AiterFlashAttentionBackend.validate_configuration(
+        head_size=128,
+        dtype=torch.bfloat16,
+        kv_cache_dtype="fp8_e5m2",
+        block_size=BLOCK_SIZE,
+        use_mla=False,
+        has_sink=False,
+        use_sparse=False,
+        use_mm_prefix=False,
+        use_per_head_quant_scales=False,
+        device_capability=current_platform.get_device_capability(),
+        attn_type=AttentionType.DECODER,
+    )
+    assert any("kv_cache_dtype" in reason for reason in reasons), reasons
 
 
 def test_aiter_mha_backend_validates_kv_cache_block_size():
