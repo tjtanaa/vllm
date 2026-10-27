@@ -341,6 +341,92 @@ def test_aiter_mha_backend_supports_compute_capability_matches_mi3xx_probe():
     )
 
 
+@pytest.mark.skipif(not on_mi3xx(), reason="MI300/MI350 ROCm only")
+def test_aiter_fa_shuffle_layout_refuses_configs_it_cannot_decode(monkeypatch):
+    """Shuffle decode (paged_attention_common) has no window, sink, soft cap or
+    ALiBi input and takes one query token per request. Those configs must be
+    refused up front instead of failing at the first decode."""
+    from types import SimpleNamespace
+
+    from tests.v1.attention.utils import (
+        create_standard_kv_cache_spec,
+        create_vllm_config,
+    )
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers.attention import Attention
+    from vllm.v1.attention import backend as backend_module
+    from vllm.v1.attention.backend import AttentionType
+    from vllm.v1.attention.backends.rocm_aiter_fa import (
+        AiterFlashAttentionBackend,
+        AiterFlashAttentionImpl,
+        AiterFlashAttentionMetadataBuilder,
+    )
+
+    monkeypatch.setattr(rocm_aiter_ops, "_SHUFFLE_KV_CACHE_ENABLED", True)
+    selector_args = dict(
+        head_size=128,
+        dtype=torch.bfloat16,
+        kv_cache_dtype="auto",
+        block_size=BLOCK_SIZE,
+        use_mla=False,
+        has_sink=False,
+        use_sparse=False,
+        use_mm_prefix=False,
+        use_per_head_quant_scales=False,
+        device_capability=current_platform.get_device_capability(),
+        attn_type=AttentionType.DECODER,
+    )
+    validate = AiterFlashAttentionBackend.validate_configuration
+    assert validate(**selector_args) == []
+    # The selector picks another backend for these.
+    assert validate(**{**selector_args, "has_sink": True})
+    assert validate(**selector_args, has_sliding_window=True)
+
+    # Soft cap and ALiBi are not selector inputs; the impl refuses them.
+    for feature in (
+        {"logits_soft_cap": 30.0},
+        {"alibi_slopes": [0.5] * 8},
+        {"sinks": torch.zeros(8)},
+    ):
+        with pytest.raises(NotImplementedError, match="shuffle KV cache layout"):
+            AiterFlashAttentionImpl(
+                8,
+                128,
+                128**-0.5,
+                8,
+                alibi_slopes=feature.get("alibi_slopes"),
+                sliding_window=None,
+                kv_cache_dtype="auto",
+                logits_soft_cap=feature.get("logits_soft_cap"),
+                sinks=feature.get("sinks"),
+            )
+
+    # Spec decode makes multi-token decodes, which shuffle decode cannot take.
+    config = create_vllm_config(model_name="Qwen/Qwen3-0.6B", dtype="bfloat16")
+    object.__setattr__(
+        config, "speculative_config", SimpleNamespace(num_speculative_tokens=3)
+    )
+    monkeypatch.setattr(backend_module, "max_decode_query_len", lambda _: 4)
+    with set_current_vllm_config(config):
+        Attention(
+            config.model_config.get_num_attention_heads(config.parallel_config),
+            config.model_config.get_head_size(),
+            config.model_config.get_head_size() ** -0.5,
+            config.model_config.get_num_kv_heads(config.parallel_config),
+            cache_config=config.cache_config,
+            prefix="layer",
+            attn_backend=AiterFlashAttentionBackend,
+        )
+        with pytest.raises(ValueError, match="multi-token decode"):
+            AiterFlashAttentionMetadataBuilder(
+                create_standard_kv_cache_spec(config),
+                ["layer"],
+                config,
+                torch.device("cuda"),
+            )
+
+
 # Env and platform gate tests ---------------------------------------------
 @pytest.mark.skipif(not on_mi3xx(), reason="MI300/MI350 ROCm only")
 @pytest.mark.parametrize(
