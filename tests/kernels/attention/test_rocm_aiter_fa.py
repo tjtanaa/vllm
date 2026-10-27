@@ -329,6 +329,20 @@ def test_aiter_mha_backend_validates_kv_cache_block_size():
     )
 
 
+def test_aiter_fa_shuffle_layout_lists_only_dense_kv_planes(monkeypatch):
+    """Shuffle decode (pa_fwd_asm) steps between pages by a whole dense page,
+    so K and V must each be one plane spanning every block (LHBNC). Under
+    LBHNC they alternate block by block, so it must not be listed."""
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.v1.attention.backends.rocm_aiter_fa import AiterFlashAttentionBackend
+    from vllm.v1.kv_cache_interface import KVCacheLayout
+
+    monkeypatch.setattr(rocm_aiter_ops, "_SHUFFLE_KV_CACHE_ENABLED", True)
+    assert AiterFlashAttentionBackend.supported_kv_cache_layouts() == (
+        KVCacheLayout.LHBNC,
+    )
+
+
 def test_aiter_mha_backend_supports_compute_capability_matches_mi3xx_probe():
     """The backend should trust the ROCm MI3xx probe instead of the raw torch
     capability tuple."""
