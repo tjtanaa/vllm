@@ -703,6 +703,8 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
     # Set from the common metadata every build; a batch is causal unless the
     # drafter says otherwise.
     _decode_causal: bool = True
+    # Host-side sequence lengths of the batch being built (see build()).
+    _seq_lens_cpu_upper_bound: torch.Tensor | None = None
     # A non-causal draft needs no cross-shard causal window: the ordinary
     # mask0 decode returns per-row LSE for the DCP merge.
     supports_non_causal_multi_token_dcp: ClassVar[bool] = True
@@ -860,6 +862,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
 
         self.compilation_config = vllm_config.compilation_config
         self.decode_attn_out_dtype = vllm_config.model_config.dtype
+        self._async_scheduling = bool(vllm_config.scheduler_config.async_scheduling)
 
         # Needed to place a verify row's causal window on this rank's KV shard.
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
@@ -1778,19 +1781,20 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         # buffer to build here. mla_gluon still wants a lower bound on the KV
         # length it is asked to split; on the verify path that bound is over
         # active requests, not cudagraph padding rows pinned to max_qo_len.
-        # The .item() below runs in the builder, outside the captured region,
-        # so it does not abort HIP graph capture the way the per-layer syncs
-        # in forward_mqa did. DCP verify never reaches here -- it carries its
-        # own per-row lengths instead of a single split bound.
+        # It is read from the host-side sequence lengths: a .min().item() on
+        # the device lengths would sync the GPU on every decode step. Async
+        # scheduling makes those lengths optimistic by up to the rejected
+        # drafts, so subtract the draft count there. DCP verify never reaches
+        # here -- it carries its own per-row lengths instead of a split bound.
         min_kv_seq_len = 1
-        if use_gluon_verify:
-            per_req_len = paged_kv_indptr[1:] - paged_kv_indptr[:-1]
-            if pad_uniform_mtp:
-                active = qo_lens_device > 0
-                if active.any():
-                    min_kv_seq_len = int(per_req_len[active].min().item())
-            else:
-                min_kv_seq_len = int(per_req_len.min().item())
+        seq_lens_cpu = self._seq_lens_cpu_upper_bound
+        if use_gluon_verify and seq_lens_cpu is not None:
+            active = qo_len > 0
+            if bool(active.any()):
+                min_kv_seq_len = int(seq_lens_cpu[:num_reqs][active].min())
+                if self._async_scheduling:
+                    min_kv_seq_len -= self._mtp_decode_qlen - 1
+                min_kv_seq_len = max(1, min_kv_seq_len)
 
         dcp_verify = None
         if _is_row_view_dcp_route(dcp_route):
@@ -1872,6 +1876,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         # on the per-ubatch Aiter builder instead of changing that shared API;
         # super().build invokes _build_decode synchronously.
         self._decode_causal = common_attn_metadata.causal
+        self._seq_lens_cpu_upper_bound = common_attn_metadata.seq_lens_cpu_upper_bound
         attn_metadata = super().build(
             common_prefix_len, common_attn_metadata, fast_build
         )
