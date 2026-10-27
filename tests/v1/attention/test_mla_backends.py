@@ -479,6 +479,9 @@ BATCH_SPECS = {
     "large_prefill": BatchSpec(seq_lens=[4096] * 8, query_lens=[32] * 8),
     "single_decode": BatchSpec(seq_lens=[1024], query_lens=[1]),
     "single_prefill": BatchSpec(seq_lens=[1024], query_lens=[64]),
+    # No context: with an fp8 cache on gfx950, ROCM_AITER_MLA runs these on its
+    # fp8 asm prefill.
+    "prefill_without_context": BatchSpec(seq_lens=[64, 200], query_lens=[64, 200]),
     "spec_decode_small": BatchSpec(
         seq_lens=[128, 256, 512, 1024], query_lens=[4, 4, 4, 4]
     ),
@@ -2207,6 +2210,40 @@ def test_backend_correctness(
         prefill_backend,
         qk_nope_head_dim,
         v_head_dim,
+    )
+
+
+@pytest.mark.parametrize(
+    ("prefill_backend", "qk_nope_head_dim", "v_head_dim"),
+    [p for p in _prefill_backend_dimension_params() if p.values[1:] != (128, 128)],
+)
+@pytest.mark.parametrize("kv_cache_dtype", ["fp8", "fp8_e4m3"])
+def test_fp8_prefill_without_context_other_head_dims(
+    default_vllm_config,
+    dist_init,
+    workspace_init,
+    prefill_backend: MLAPrefillBackendEnum,
+    qk_nope_head_dim: int,
+    v_head_dim: int,
+    kv_cache_dtype: str,
+):
+    """AITER's fp8 asm MLA prefill exists only for qk 192 / v 128 head dims.
+    ROCM_AITER_MLA must serve other dims (GLM-4.7-Flash: qk 256 / v 256) on its
+    regular prefill path; loading the asm kernel for them aborts the process
+    in mla_reduce_v1."""
+    _run_backend_correctness(
+        default_vllm_config,
+        dist_init,
+        workspace_init,
+        batch_spec_name="prefill_without_context",
+        model="deepseek-ai/DeepSeek-R1",
+        tensor_parallel_size=1,
+        kv_cache_dtype=kv_cache_dtype,
+        q_scale=1.0,
+        k_scale=1.0,
+        prefill_backend=prefill_backend,
+        qk_nope_head_dim=qk_nope_head_dim,
+        v_head_dim=v_head_dim,
     )
 
 

@@ -147,6 +147,21 @@ def _fp8_mla_prefill_supported() -> bool:
     return True
 
 
+# AITER ships mla_prefill_ps_asm_fwd for one geometry only
+# (mla_pfl_qh192_vh128_*). Other dims load that kernel anyway, and
+# mla_reduce_v1 then aborts the process on the unsupported v head dim.
+_FP8_PREFILL_QK_HEAD_DIM: Final = 192
+_FP8_PREFILL_V_HEAD_DIM: Final = 128
+
+
+def _fp8_mla_prefill_dims_supported(qk_head_dim: int, v_head_dim: int) -> bool:
+    """Whether the FP8 asm prefill has a kernel for these head dims."""
+    return (
+        qk_head_dim == _FP8_PREFILL_QK_HEAD_DIM
+        and v_head_dim == _FP8_PREFILL_V_HEAD_DIM
+    )
+
+
 @functools.lru_cache(maxsize=1)
 def _fused_mla_prefill_qkv_supported() -> bool:
     """Gate ``fused_mla_prefill_qkv_fp8`` to CDNA4 (gfx950).
@@ -1038,6 +1053,10 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             kv_cache_dtype_str == "fp8"
             and vllm_config.model_config.dtype == torch.bfloat16
             and AiterMLAHelper.is_valid_num_heads(self.num_heads)
+            and _fp8_mla_prefill_dims_supported(
+                self.mla_dims.qk_nope_head_dim + self.mla_dims.qk_rope_head_dim,
+                self.mla_dims.v_head_dim,
+            )
         )
         if self._fp8_prefill_enabled:
             max_prefill_qlen = min(
@@ -2292,6 +2311,9 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         self._fp8_prefill_enabled = _fp8_mla_prefill_supported() and (
             is_quantized_kv_cache(kv_cache_dtype)
             and AiterMLAHelper.is_valid_num_heads(self.num_heads)
+            and _fp8_mla_prefill_dims_supported(
+                self.qk_nope_head_dim + self.qk_rope_head_dim, self.v_head_dim
+            )
         )
         self._fused_prefill_qkv = False
         if self._fp8_prefill_enabled:
