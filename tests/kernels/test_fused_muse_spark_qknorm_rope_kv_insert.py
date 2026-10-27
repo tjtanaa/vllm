@@ -351,9 +351,10 @@ def test_fused_kv_insert_requires_backend_bypass_support(monkeypatch):
             parallel_config=SimpleNamespace(decode_context_parallel_size=1)
         ),
     )
+    bypass = False
     backend = SimpleNamespace(
         forward_includes_kv_cache_update=False,
-        supports_kv_cache_update_bypass=False,
+        supports_kv_update_bypass=lambda: bypass,
     )
     attn_layer = SimpleNamespace(
         attn_backend=backend,
@@ -362,7 +363,7 @@ def test_fused_kv_insert_requires_backend_bypass_support(monkeypatch):
     )
 
     assert not fused_ops.supports_fused_kv_insert(attn_layer)
-    backend.supports_kv_cache_update_bypass = True
+    bypass = True
     assert fused_ops.supports_fused_kv_insert(attn_layer)
 
 
@@ -386,8 +387,37 @@ def test_rocm_aiter_fa_takes_the_fused_kv_insert(monkeypatch):
     # The kernel writes the packed [B, H, N, 2*hd] page, so the backend only
     # accepts the bypass outside the shuffle layout.
     shuffle = rocm_aiter_ops.is_shuffle_kv_cache_enabled()
-    assert AiterFlashAttentionBackend.supports_kv_cache_update_bypass is not shuffle
+    assert AiterFlashAttentionBackend.supports_kv_update_bypass() is not shuffle
     assert fused_ops.supports_fused_kv_insert(attn_layer) is not shuffle
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm backend gate")
+def test_rocm_aiter_fa_kv_update_bypass_follows_the_shuffle_toggle(monkeypatch):
+    """Bypass support is read when asked for, not frozen when rocm_aiter_fa is
+    imported, so a shuffle toggle after import (an env refresh) is honored and
+    the packed-layout insert never writes into a shuffle cache."""
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.v1.attention.backends.rocm_aiter_fa import AiterFlashAttentionBackend
+
+    monkeypatch.setattr(
+        fused_ops,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(
+            parallel_config=SimpleNamespace(decode_context_parallel_size=1)
+        ),
+    )
+    attn_layer = SimpleNamespace(
+        attn_backend=AiterFlashAttentionBackend,
+        kv_sharing_target_layer_name=None,
+        kv_cache_dtype="auto",
+    )
+    imported_with = rocm_aiter_ops.is_shuffle_kv_cache_enabled()
+    for shuffle in (not imported_with, imported_with):
+        monkeypatch.setattr(
+            rocm_aiter_ops, "is_shuffle_kv_cache_enabled", lambda s=shuffle: s
+        )
+        assert AiterFlashAttentionBackend.supports_kv_update_bypass() is not shuffle
+        assert fused_ops.supports_fused_kv_insert(attn_layer) is not shuffle
 
 
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm compile boundary")
