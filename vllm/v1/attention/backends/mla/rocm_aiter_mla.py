@@ -656,6 +656,9 @@ class AiterMLADecodeMetadata(MLACommonDecodeMetadata):
     use_gluon_decode: bool = False
     # Small-head non-DCP multi-token verify uses Gluon's native MTP entry.
     use_gluon_verify: bool = False
+    # 2-token blocks padded to max_qo_len (4) queries for the fp8 asm decode;
+    # see AiterMLAHelper.uses_fp8_qlen2_padding.
+    fp8_qlen2_padded: bool = False
     # Whether persistent MLA metadata was computed
     has_persistent_metadata: bool = False
     varlen_q_rows: torch.Tensor | None = None
@@ -969,6 +972,20 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         # _build_decode needs the cache dtype to pick the decode kernel; keep
         # the normalized string instead of dropping it at the end of __init__.
         self._kv_cache_dtype_str = kv_cache_dtype_str
+        # DCP verify takes its own routes; only the plain decode is padded.
+        self._pad_fp8_qlen2 = (
+            self.dcp_world_size == 1
+            and self._mtp_decode_qlen >= 2
+            and AiterMLAHelper.uses_fp8_qlen2_padding(
+                self._decode_num_heads, kv_cache_dtype_str
+            )
+        )
+        # The persistent schedule is sized for the widest block the kernel sees.
+        self._kernel_max_qlen = (
+            max(self._mtp_decode_qlen, AiterMLAHelper._FP8_QLEN2_PADDED_QLEN)
+            if self._pad_fp8_qlen2
+            else self._mtp_decode_qlen
+        )
         # Sized per layer, matching the flat KV tensor the kernel is handed.
         num_gpu_blocks = vllm_config.cache_config.num_gpu_blocks
         self._kv_cache_bytes = (
@@ -994,7 +1011,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             (reduce_partial_map_size, reduce_partial_map_type),
         ) = get_mla_metadata_info_v1(
             max_num_reqs,
-            self._mtp_decode_qlen,
+            self._kernel_max_qlen,
             self._num_attention_heads,
             q_dtype,
             kv_dtype,
@@ -1508,8 +1525,34 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
     ) -> AiterMLADecodeMetadata:
         causal = self._decode_causal
         device = self.device
-        num_reqs = seq_lens_device.size(0)
         qo_len = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        if self._pad_fp8_qlen2 and self._varlen_decode_qlen == 0:
+            # Rows with no query tokens (padding requests whose tokens were not
+            # padded, or requests whose KV an async connector is loading) make
+            # a 2-token block non-uniform, so it would skip the qseqlen-4
+            # padding below and hit AITER's wrong qseqlen-2 kernel. They have
+            # no output: leave them out of the kernel. A batch whose q buffer
+            # is padded to the captured size keeps them (pad_uniform_mtp).
+            live = qo_len > 0
+            lens = qo_len.tolist()
+            if (
+                not all(lens)
+                and num_decode_tokens == sum(lens)
+                and all(n == 2 for n in qo_len[live].tolist())
+            ):
+                rows = live.nonzero().flatten()
+                rows_device = rows.to(device, non_blocking=True)
+                block_table_tensor = block_table_tensor.index_select(0, rows_device)
+                seq_lens_device = seq_lens_device.index_select(0, rows_device)
+                qo_len = qo_len[live]
+                query_start_loc_cpu = torch.zeros(
+                    qo_len.numel() + 1, dtype=query_start_loc_cpu.dtype
+                )
+                torch.cumsum(qo_len, 0, out=query_start_loc_cpu[1:])
+                query_start_loc_device = query_start_loc_cpu.to(
+                    device, non_blocking=True
+                )
+        num_reqs = seq_lens_device.size(0)
         varlen_decode = self._varlen_decode_qlen > 0 and causal
         if varlen_decode:
             max_qo_len = self._varlen_decode_qlen
@@ -1522,6 +1565,18 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             if padded_mtp_qo_len > 0:
                 max_qo_len = padded_mtp_qo_len
             pad_uniform_mtp = padded_mtp_qo_len > 0
+        # See AiterMLAHelper.uses_fp8_qlen2_padding. Every live request is a
+        # 2-token block (the decode split requires a uniform block; dummy
+        # graph-padding requests are excluded by pad_uniform_mtp).
+        pad_fp8_qlen2 = (
+            self._pad_fp8_qlen2
+            and not varlen_decode
+            and max_qo_len == 2
+            and (pad_uniform_mtp or bool(torch.all(qo_len == 2)))
+        )
+        kernel_qlen = (
+            AiterMLAHelper._FP8_QLEN2_PADDED_QLEN if pad_fp8_qlen2 else max_qo_len
+        )
 
         seq_lens_for_kernel = seq_lens_device
         # the global lengths need the same dummy-row
@@ -1648,9 +1703,9 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             # paged_kv_last_page_len already uses the pre-initialized buffer slice
             # (set above), so no copy needed - buffer is always 1s.
 
-            if pad_uniform_mtp:
+            if pad_uniform_mtp or pad_fp8_qlen2:
                 qo_indptr_src = AiterMLAHelper.qo_indptr_for_uniform_qlen(
-                    num_kernel_reqs, int(max_qo_len), device
+                    num_kernel_reqs, int(kernel_qlen), device
                 )
             else:
                 qo_indptr_src = query_start_loc_device[: 1 + num_kernel_reqs]
@@ -1666,9 +1721,9 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                     num_kernel_reqs, 1, device
                 )
             else:
-                if pad_uniform_mtp:
+                if pad_uniform_mtp or pad_fp8_qlen2:
                     qo_indptr = AiterMLAHelper.qo_indptr_for_uniform_qlen(
-                        num_kernel_reqs, int(max_qo_len), device
+                        num_kernel_reqs, int(kernel_qlen), device
                     )
                 else:
                     qo_indptr = query_start_loc_device[: 1 + num_kernel_reqs]
@@ -1713,6 +1768,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         if (
             not causal
             and max_qo_len == 2
+            and not pad_fp8_qlen2
             and is_quantized_kv_cache(self._kv_cache_dtype_str)
             and not AiterMLAHelper.has_fp8_non_causal_qlen2_kernel(
                 self._decode_num_heads
@@ -1732,7 +1788,9 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             from aiter import get_mla_metadata_v1
 
             uni_qo_len = (
-                max_qo_len if pad_uniform_mtp or torch.all(qo_len == max_qo_len) else -1
+                kernel_qlen
+                if pad_uniform_mtp or pad_fp8_qlen2 or torch.all(qo_len == max_qo_len)
+                else -1
             )
             cprr_kwargs: dict = {}
             is_causal = causal
@@ -1764,7 +1822,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                 self._mla_reduce_partial_map,
                 page_size=1,
                 kv_granularity=16,
-                max_seqlen_qo=max_qo_len,
+                max_seqlen_qo=kernel_qlen,
                 uni_seqlen_qo=uni_qo_len,
                 fast_mode=True,
                 dtype_q=self._mla_q_dtype,
@@ -1810,7 +1868,8 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             paged_kv_last_page_len=paged_kv_last_page_len,
             qo_indptr=qo_indptr,
             dcp_tot_seq_lens=dcp_tot_seq_lens_device,
-            max_qo_len=max_qo_len,
+            max_qo_len=kernel_qlen,
+            fp8_qlen2_padded=pad_fp8_qlen2,
             min_kv_seq_len=min_kv_seq_len,
             dcp_route=dcp_route,
             dcp_verify=dcp_verify,
@@ -1999,6 +2058,9 @@ class AiterMLAHelper:
     # non-causal 16-head / 4-token kernel. Other multiples of 16 (48/80/112)
     # fold to H16 while keeping Q2, which has no non-causal fp8 entry.
     _AITER_FP8_NON_CAUSAL_QLEN2_HEADS: ClassVar[tuple[int, ...]] = (32, 64, 96, 128)
+    # Query length the fp8 16-head-family qlen-2 blocks are padded to; see
+    # uses_fp8_qlen2_padding.
+    _FP8_QLEN2_PADDED_QLEN: Final = 4
 
     @staticmethod
     def qo_indptr_for_uniform_qlen(
@@ -2047,6 +2109,31 @@ class AiterMLAHelper:
         """
         kernel_heads = AiterMLAHelper.get_actual_mla_num_heads(num_heads)
         return kernel_heads in AiterMLAHelper._AITER_FP8_NON_CAUSAL_QLEN2_HEADS
+
+    @staticmethod
+    def uses_fp8_qlen2_padding(num_heads: int, kv_cache_dtype: str) -> bool:
+        """Whether fp8 2-token decode blocks run as padded 4-token blocks.
+
+        On gfx950, AITER serves fp8 qlen 2 at 16 heads (and 48/80/112, folded
+        onto 16, and every padded count below 16) with
+        mla_a8w8_qh16_qseqlen2_gqaratio16, persistent or not. That kernel
+        returns wrong rows (head 0 of the second query, up to 0.9 abs error)
+        when a request's KV length sits just past a tile edge (9-12, 33, 129
+        tokens), so DeepSeek-V3 at TP8 with MTP-1 and an fp8 cache corrupts
+        attention as sequences grow through those lengths. The qseqlen-4
+        kernel is correct there, so the block is padded to 4 queries: two
+        leading copies of the first query, whose outputs are dropped. Causal
+        masking is aligned to the end of the block, so the real queries keep
+        their windows. 32/64/96/128 heads have native fp8 qlen-2 kernels.
+        """
+        if not is_quantized_kv_cache(kv_cache_dtype):
+            return False
+        from vllm.platforms.rocm import on_gfx950
+
+        if not on_gfx950():
+            return False
+        kernel_heads = AiterMLAHelper.get_actual_mla_num_heads(num_heads)
+        return kernel_heads not in AiterMLAHelper._AITER_FP8_NON_CAUSAL_QLEN2_HEADS
 
     @staticmethod
     def get_actual_mla_num_heads(num_heads: int) -> int:
@@ -2933,6 +3020,14 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         assert isinstance(q, torch.Tensor)
         assert decode.paged_kv_indptr is not None
         assert decode.paged_kv_indices is not None
+        num_tokens = q.shape[0]
+        if decode.fp8_qlen2_padded:
+            # [r, 2] -> [r, 4]: two leading copies of each block's first query.
+            pad = decode.max_qo_len - 2
+            q_blocks = q.unflatten(0, (-1, 2))
+            q = torch.cat(
+                [q_blocks[:, :1].expand(-1, pad, -1, -1), q_blocks], dim=1
+            ).flatten(0, 1)
         B = q.shape[0]
 
         assert q.shape[1] == self._decode_num_heads, (
@@ -3040,4 +3135,9 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             output = AiterMLAHelper.get_mla_unpadded_o(self._decode_num_heads, o)
             if lse is not None:
                 lse = AiterMLAHelper.get_mla_unpadded_lse(self._decode_num_heads, lse)
+        if decode.fp8_qlen2_padded:
+            # DCP never pads (the builder excludes it), so there is no LSE.
+            assert lse is None
+            output = output.unflatten(0, (-1, decode.max_qo_len))[:, -2:].flatten(0, 1)
+            assert output.shape[0] == num_tokens
         return output, lse

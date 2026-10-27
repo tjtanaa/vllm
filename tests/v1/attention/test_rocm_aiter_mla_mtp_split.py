@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import itertools
 import math
 import sys
 from types import SimpleNamespace
@@ -166,6 +167,7 @@ def _builder(
         _mla_kv_dtype=torch.bfloat16,
         decode_attn_out_dtype=torch.bfloat16,
         _decode_causal=decode_causal,
+        _pad_fp8_qlen2=False,
         # Default off so existing cases keep exercising segmented/persistent.
         # Pass asm_dcp_verify=True for the CPRR route and its qlen-floor fallback.
         _asm_dcp_verify=asm_dcp_verify,
@@ -511,6 +513,7 @@ def test_non_causal_dcp_block_bypasses_cprr_in_forward(monkeypatch):
         paged_kv_last_page_len=torch.ones(1, dtype=torch.int32),
         use_gluon_decode=False,
         use_gluon_verify=False,
+        fp8_qlen2_padded=False,
         dcp_route=rocm_aiter_mla._DCPDecodeRoute.PLAIN,
         dcp_verify=None,
         g_kv_indptr=None,
@@ -575,6 +578,7 @@ def test_single_token_dcp_decode_returns_unpadded_lse(monkeypatch):
         paged_kv_last_page_len=torch.ones(num_tokens, dtype=torch.int32),
         use_gluon_decode=False,
         use_gluon_verify=False,
+        fp8_qlen2_padded=False,
         dcp_route=rocm_aiter_mla._DCPDecodeRoute.PLAIN,
         dcp_verify=None,
         has_persistent_metadata=False,
@@ -802,6 +806,7 @@ def test_segmented_dcp_verify_matches_causal_attention(monkeypatch):
             ),
             use_gluon_decode=False,
             use_gluon_verify=False,
+            fp8_qlen2_padded=False,
             dcp_route=rocm_aiter_mla._DCPDecodeRoute.SEGMENTED,
             dcp_verify=view,
             attn_out_dtype=torch.bfloat16,
@@ -1485,3 +1490,55 @@ def test_varlen_cudagraph_bound_follows_adaptive_verification():
     # decided per batch, so the merged non-causal spec keeps the bound.
     shared_draft_group = SimpleNamespace(non_causal_multi_token_decode=True)
     assert bound(_adaptive_config(), shared_draft_group) == 8
+
+
+@pytest.mark.parametrize(
+    ("query_lens", "kernel_rows"),
+    [([2, 2, 2], 3), ([2, 2, 0, 0], 2), ([2, 0, 2, 0], 2)],
+    ids=["uniform", "trailing-zero-query", "interleaved-zero-query"],
+)
+def test_fp8_qlen2_block_is_padded_without_zero_query_rows(
+    monkeypatch, query_lens, kernel_rows
+):
+    """fp8 2-token blocks on the 16-head kernel family run as padded 4-token
+    blocks. Rows with no query tokens (padding requests whose tokens were not
+    padded, or async KV loads) leave the kernel instead of making the block
+    non-uniform, which skipped the padding and ran AITER's wrong qseqlen-2
+    kernel."""
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter",
+        SimpleNamespace(get_mla_metadata_v1=mock.MagicMock()),
+    )
+    monkeypatch.setattr(
+        rocm_aiter_mla, "_expand_page_indices_kernel", _NoOpTritonKernel()
+    )
+    builder = _builder(mtp_decode_qlen=2, num_heads=16, kv_cache_dtype="fp8")
+    builder._pad_fp8_qlen2 = True
+    num_reqs = len(query_lens)
+    seq_lens = torch.tensor(
+        [40 + 7 * i if q else 0 for i, q in enumerate(query_lens)], dtype=torch.int32
+    )
+    query_start_loc = torch.zeros(num_reqs + 1, dtype=torch.int32)
+    query_start_loc[1:] = torch.tensor(query_lens).cumsum(0)
+
+    metadata = AiterMLAMetadataBuilder._build_decode(
+        builder,
+        block_table_tensor=torch.arange(num_reqs * 8, dtype=torch.int32).view(
+            num_reqs, 8
+        ),
+        seq_lens_device=seq_lens,
+        max_seq_len=int(seq_lens.max()),
+        query_start_loc_cpu=query_start_loc,
+        query_start_loc_device=query_start_loc,
+        num_decode_tokens=sum(query_lens),
+        max_query_len=2,
+        dcp_tot_seq_lens_device=None,
+    )
+
+    assert metadata.fp8_qlen2_padded
+    assert metadata.max_qo_len == 4
+    assert metadata.qo_indptr.tolist() == list(range(0, 4 * kernel_rows + 1, 4))
+    live = [s for s, q in zip(seq_lens.tolist(), query_lens) if q]
+    assert metadata.seq_lens.tolist() == live
+    assert metadata.paged_kv_indptr.tolist() == [0, *itertools.accumulate(live)]
