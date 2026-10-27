@@ -1196,3 +1196,259 @@ def test_asm_kv_scale_tables_shared_across_builders():
     assert isinstance(
         AiterFlashAttentionMetadataBuilder.asm_kv_scale_tables, AsmKvScaleTables
     )
+
+
+def _zero_query_reference(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    query_lens: list[int],
+    seq_lens: list[int],
+    slots: list[torch.Tensor],
+    scale: float,
+    *,
+    causal: bool = True,
+    soft_cap: float = 0.0,
+    sinks: torch.Tensor | None = None,
+    alibi_slopes: torch.Tensor | None = None,
+    sliding_window: int | None = None,
+) -> torch.Tensor:
+    """Float32 attention of each request over the K/V at its cache slots."""
+    out = torch.empty(query.shape, dtype=torch.float32)
+    start = 0
+    for q_len, seq_len, req_slots in zip(query_lens, seq_lens, slots):
+        q = query[start : start + q_len].float()
+        k = key[req_slots].float()
+        v = value[req_slots].float()
+        group = q.shape[1] // k.shape[1]
+        k = k.repeat_interleave(group, dim=1)
+        v = v.repeat_interleave(group, dim=1)
+        logits = torch.einsum("qhd,khd->hqk", q, k) * scale
+        if soft_cap:
+            logits = soft_cap * torch.tanh(logits / soft_cap)
+        rel = (
+            torch.arange(seq_len)[None, :]
+            - torch.arange(seq_len - q_len, seq_len)[:, None]
+        )
+        if alibi_slopes is not None:
+            logits = logits + alibi_slopes.float()[:, None, None] * rel[None]
+        if causal:
+            logits = logits.masked_fill(rel[None] > 0, float("-inf"))
+        if sliding_window is not None:
+            logits = logits.masked_fill(rel[None] <= -sliding_window, float("-inf"))
+        if sinks is not None:
+            sink_col = sinks.float()[:, None, None].expand(-1, q_len, 1)
+            probs = torch.softmax(torch.cat([logits, sink_col], dim=-1), -1)[..., :-1]
+        else:
+            probs = torch.softmax(logits, dim=-1)
+        out[start : start + q_len] = torch.einsum("hqk,khd->qhd", probs, v)
+        start += q_len
+    return out
+
+
+def _zero_query_run(
+    query_lens: list[int],
+    seq_lens: list[int],
+    *,
+    head_size: int = 128,
+    kv_cache_dtype: str = "auto",
+    causal: bool = True,
+    soft_cap: float | None = None,
+    use_sinks: bool = False,
+    use_alibi: bool = False,
+    sliding_window: int | None = None,
+    padded_tokens: int = 0,
+    query_gain: float = 1.0,
+    decode_threshold: int = 1,
+):
+    """Forward one ROCM_AITER_FA layer over a paged batch.
+
+    Returns (output, reference, metadata). Every request gets its own blocks;
+    ``padded_tokens`` extra Q/output rows (NaN) follow the real tokens, as
+    the runner pads them.
+    """
+    import dataclasses
+
+    from tests.v1.attention.utils import (
+        BatchSpec,
+        create_common_attn_metadata,
+        create_standard_kv_cache_spec,
+        create_vllm_config,
+    )
+    from vllm.config import ModelConfig, set_current_vllm_config
+    from vllm.model_executor.layers.attention import Attention
+    from vllm.v1.attention.backends.rocm_aiter_fa import (
+        AiterFlashAttentionBackend,
+        AiterFlashAttentionMetadataBuilder,
+    )
+
+    _assert_aiter_supported()
+    set_random_seed(0)
+    num_heads, num_kv_heads = 16, 4
+    config = create_vllm_config(
+        model_name="Qwen/Qwen3-0.6B",
+        dtype="bfloat16",
+        max_model_len=4096,
+        max_num_batched_tokens=1024,
+    )
+    # hf_overrides, not a post-init hf_config update: the builder sizes its
+    # extend workspace from the model config's head size and KV heads.
+    config.model_config = ModelConfig(
+        model="Qwen/Qwen3-0.6B",
+        tokenizer="Qwen/Qwen3-0.6B",
+        dtype="bfloat16",
+        seed=0,
+        max_model_len=4096,
+        hf_overrides={
+            "head_dim": head_size,
+            "num_attention_heads": num_heads,
+            "num_key_value_heads": num_kv_heads,
+        },
+    )
+    config.cache_config.cache_dtype = kv_cache_dtype
+    batch = BatchSpec(seq_lens=seq_lens, query_lens=query_lens)
+    common = create_common_attn_metadata(
+        batch, BLOCK_SIZE, torch.device("cuda"), arange_block_indices=True
+    )
+    common = dataclasses.replace(common, causal=causal)
+    num_blocks = common.block_table_tensor.numel()
+    scale = head_size**-0.5
+    extra = {}
+    if use_sinks:
+        extra["sinks"] = torch.randn(num_heads, dtype=torch.float32)
+    alibi = (
+        [2 ** (-8 * (i + 1) / num_heads) for i in range(num_heads)]
+        if use_alibi
+        else None
+    )
+    with set_current_vllm_config(config):
+        layer = Attention(
+            num_heads,
+            head_size,
+            scale,
+            num_kv_heads,
+            alibi_slopes=alibi,
+            cache_config=config.cache_config,
+            logits_soft_cap=soft_cap,
+            per_layer_sliding_window=sliding_window,
+            prefix="layer",
+            attn_backend=AiterFlashAttentionBackend,
+            **extra,
+        )
+        builder = AiterFlashAttentionMetadataBuilder(
+            create_standard_kv_cache_spec(config),
+            ["layer"],
+            config,
+            torch.device("cuda"),
+        )
+        # > 1 makes multi-token requests decodes, as spec decode does.
+        builder.reorder_batch_threshold = decode_threshold
+        with torch.device("cpu"):
+            metadata = builder.build(0, common)
+    cache_dtype = (
+        current_platform.fp8_dtype() if kv_cache_dtype == "fp8" else torch.bfloat16
+    )
+    kv_cache = torch.zeros(
+        num_blocks, num_kv_heads, BLOCK_SIZE, 2 * head_size, dtype=cache_dtype
+    )
+    layer.kv_cache = kv_cache
+    num_slots = num_blocks * BLOCK_SIZE
+    key = torch.randn(num_slots, num_kv_heads, head_size, dtype=torch.bfloat16)
+    value = torch.randn_like(key)
+    if kv_cache_dtype == "fp8":
+        # Store values fp8 represents exactly, so only kernel error remains.
+        key = key.to(cache_dtype).to(key.dtype)
+        value = value.to(cache_dtype).to(value.dtype)
+    layer.impl.do_kv_cache_update(
+        layer, key, value, kv_cache, torch.arange(num_slots, dtype=torch.int64)
+    )
+    with torch.device("cpu"):
+        table = common.block_table_tensor.cpu().long()
+        slots = []
+        for i, seq_len in enumerate(seq_lens):
+            pos = torch.arange(seq_len)
+            slots.append(table[i, pos // BLOCK_SIZE] * BLOCK_SIZE + pos % BLOCK_SIZE)
+        new_slots = torch.cat(
+            [sl[s - q :] for sl, q, s in zip(slots, query_lens, seq_lens)]
+        ).cuda()
+    num_tokens = sum(query_lens)
+    num_rows = num_tokens + padded_tokens
+    query = query_gain * torch.randn(
+        num_rows, num_heads, head_size, dtype=torch.bfloat16
+    )
+    new_key = torch.zeros(num_rows, num_kv_heads, head_size, dtype=torch.bfloat16)
+    new_value = torch.zeros_like(new_key)
+    new_key[:num_tokens] = key[new_slots]
+    new_value[:num_tokens] = value[new_slots]
+    output = torch.full_like(query, float("nan"))
+    layer.impl.forward(layer, query, new_key, new_value, kv_cache, metadata, output)
+    with torch.device("cpu"):
+        expected = _zero_query_reference(
+            query[:num_tokens].cpu(),
+            key.cpu(),
+            value.cpu(),
+            query_lens,
+            seq_lens,
+            slots,
+            scale,
+            causal=causal,
+            soft_cap=soft_cap or 0.0,
+            sinks=layer.impl.sinks.cpu() if use_sinks else None,
+            alibi_slopes=layer.impl.alibi_slopes.cpu() if use_alibi else None,
+            sliding_window=sliding_window,
+        )
+    return output, expected, metadata
+
+
+# Real rows (query_lens, seq_lens) per phase, followed by two rows with no
+# query tokens: FULL CUDA graph padding (seq_len 0), or requests whose KV an
+# async connector is still loading (seq_len > 0, #51486).
+_ZERO_QUERY_REAL_ROWS = {
+    "decode": ([1, 1], [100, 37]),
+    "prefill": ([32, 7], [32, 7]),
+    "extend": ([8, 24], [200, 90]),
+    "mixed": ([1, 32, 24], [100, 200, 24]),
+}
+
+
+@pytest.mark.skipif(not on_mi3xx(), reason="MI300/MI350 ROCm only")
+@pytest.mark.parametrize("sliding_window", [None, 64])
+@pytest.mark.parametrize("tail_seq_lens", [[0, 0], [300, 37]], ids=["pad", "kv-load"])
+@pytest.mark.parametrize("batch", list(_ZERO_QUERY_REAL_ROWS))
+def test_aiter_fa_rows_without_query_tokens(
+    monkeypatch, batch, tail_seq_lens, sliding_window
+):
+    """Rows with no query tokens after the real ones change nothing: the real
+    rows match the reference, no padded Q/output row is written, and no
+    context is gathered for them."""
+    from vllm.v1.attention.backends import rocm_aiter_fa
+
+    # 64-token context chunks, so the extend contexts below span several.
+    monkeypatch.setattr(rocm_aiter_fa, "_CP_TOKENS_PER_ITER_ROCM", 64)
+    query_lens, seq_lens = _ZERO_QUERY_REAL_ROWS[batch]
+    num_real = len(query_lens)
+    query_lens = query_lens + [0] * len(tail_seq_lens)
+    seq_lens = seq_lens + tail_seq_lens
+    num_tokens = sum(query_lens)
+    output, expected, metadata = _zero_query_run(
+        query_lens, seq_lens, sliding_window=sliding_window, padded_tokens=8
+    )
+    torch.testing.assert_close(
+        output[:num_tokens].float().cpu(), expected, atol=2e-2, rtol=2e-2
+    )
+    # A kernel that runs a zero-query row writes the row its query_start_loc
+    # points at, which is past the real tokens.
+    assert torch.isnan(output[num_tokens:]).all(), "a zero-query row was written"
+    assert metadata.num_decodes <= num_real
+    if metadata.extend_metadata is None:
+        return
+    first = metadata.num_decodes
+    rows = range(first, first + metadata.num_extends)
+    empty = [i - first for i in rows if query_lens[i] == 0]
+    chunks = metadata.extend_metadata.chunk_context_metadata
+    for c in range(chunks.num_chunks):
+        lens = chunks.cu_seq_lens_chunk[c].diff().tolist()
+        assert all(lens[i] == 0 for i in empty), (c, lens)
+    if chunks.swa_metadata is not None:
+        lens = chunks.swa_metadata.swa_cu_seqlens.diff().tolist()
+        assert all(lens[i] == 0 for i in empty), lens
