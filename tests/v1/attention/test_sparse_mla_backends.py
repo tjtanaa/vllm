@@ -148,6 +148,8 @@ def _skip_cuda_specific_sparse_mla_tests_on_rocm(request):
         "test_sparse_backend_prefill_correctness",
         "test_rocm_fused_v32_dense_prefill_matches_mqa",
         "test_rocm_long_bf16_prefill_avoids_nonpersistent_aiter",
+        "test_rocm_fp16_sparse_mla_runs_triton",
+        "test_rocm_fp16_model_rejects_fp8_kv_cache",
     }
     if (
         current_platform.is_rocm()
@@ -228,6 +230,68 @@ def test_rocm_long_bf16_prefill_avoids_nonpersistent_aiter(
         v_head_dim=128,
         monkeypatch=monkeypatch,
     )
+
+
+@pytest.mark.parametrize("batch_name", ["small_decode", "mixed_small", "small_prefill"])
+def test_rocm_fp16_sparse_mla_runs_triton(
+    default_vllm_config, dist_init, workspace_init, monkeypatch, batch_name
+):
+    """AITER's ASM sparse decode has no fp16 kernel: an fp16 model must run
+    the vLLM Triton kernels and match the reference."""
+    if not current_platform.is_rocm():
+        pytest.skip("ROCm sparse MLA regression")
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    def no_fp16_kernel(*args, **kwargs):
+        pytest.fail("An fp16 query reached AITER's ASM sparse decode")
+
+    monkeypatch.setattr(rocm_aiter_ops, "mla_decode_fwd", no_fp16_kernel)
+    test_sparse_backend_decode_correctness(
+        default_vllm_config=default_vllm_config,
+        dist_init=dist_init,
+        backend_cls=ROCMAiterMLASparseBackend,
+        batch_name=batch_name,
+        kv_cache_dtype="auto",
+        tensor_parallel_size=1,
+        block_size=64,
+        workspace_init=workspace_init,
+        q_scale=1.0,
+        k_scale=1.0,
+        total_num_heads=128,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        monkeypatch=monkeypatch,
+        dtype=torch.float16,
+    )
+
+
+def test_rocm_fp16_model_rejects_fp8_kv_cache(
+    default_vllm_config, dist_init, workspace_init, monkeypatch
+):
+    """No ROCm sparse kernel computes an fp16 query against an fp8 cache
+    correctly, so the impl refuses it with a clear error."""
+    if not current_platform.is_rocm():
+        pytest.skip("ROCm sparse MLA regression")
+    with pytest.raises(ValueError, match="fp8 KV cache with a float16 model"):
+        test_sparse_backend_decode_correctness(
+            default_vllm_config=default_vllm_config,
+            dist_init=dist_init,
+            backend_cls=ROCMAiterMLASparseBackend,
+            batch_name="small_decode",
+            kv_cache_dtype="fp8",
+            tensor_parallel_size=1,
+            block_size=64,
+            workspace_init=workspace_init,
+            q_scale=1.0,
+            k_scale=1.0,
+            total_num_heads=128,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+            monkeypatch=monkeypatch,
+            dtype=torch.float16,
+        )
 
 
 def test_nope_flashinfer_sparse_mla_uses_model_scale(monkeypatch):
@@ -534,6 +598,7 @@ def test_sparse_backend_decode_correctness(
     v_head_dim: int,
     monkeypatch,
     block_stride_rows: int | None = None,
+    dtype: torch.dtype = torch.bfloat16,
 ):
     if qk_rope_head_dim == 0 and (
         backend_cls != FlashMLASparseBackend
@@ -596,7 +661,6 @@ def test_sparse_backend_decode_correctness(
     use_nvfp4_ds_mla_quantization = kv_cache_dtype == "nvfp4_ds_mla"
 
     device = torch.device(DEVICE_TYPE)
-    dtype = torch.bfloat16
 
     # Compute per-rank heads for simulated TP
     num_heads = max(1, total_num_heads // tensor_parallel_size)

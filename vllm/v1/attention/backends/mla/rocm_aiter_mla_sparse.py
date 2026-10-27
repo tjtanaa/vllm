@@ -57,8 +57,11 @@ def _use_rocm_sparse_triton(
     num_decodes: int,
     num_decode_tokens: int,
     max_query_len: int,
+    dtype: torch.dtype = torch.bfloat16,
 ) -> bool:
-    """Select the rope-free BF16 path not supported by AITER sparse MLA.
+    """Select the vLLM Triton path for what AITER sparse MLA cannot run:
+    rope-free (NoPE) BF16, and any FP16 query (AITER's ASM decode has no FP16
+    kernel).
 
     The ragged Triton kernel indexes metadata per query token, so multi-token
     speculative verification rows have the same capability requirements as
@@ -66,7 +69,7 @@ def _use_rocm_sparse_triton(
     """
     return (
         not kv_cache_dtype.startswith("fp8")
-        and head_size == kv_lora_rank
+        and (head_size == kv_lora_rank or dtype == torch.float16)
         and (num_prefills > 0 or num_decodes > 0)
     )
 
@@ -663,6 +666,7 @@ class ROCMAiterMLASparseMetadataBuilder(
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
             max_query_len=common_attn_metadata.max_query_len,
+            dtype=self.model_dtype,
         )
         work_meta_data = None
         work_indptr = None
@@ -854,6 +858,17 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
                     "using the default sparse MLA path instead.",
                     reason,
                 )
+        if (
+            self.kv_cache_dtype.startswith("fp8")
+            and vllm_config.model_config.dtype == torch.float16
+            and not self.use_aiter_sparse_mla
+        ):
+            # AITER's fp8 ASM decode returns wrong values for an fp16 model,
+            # and the vLLM Triton kernels take no KV scale.
+            raise ValueError(
+                "ROCM_AITER_MLA_SPARSE does not support an fp8 KV cache with a "
+                "float16 model. Use --dtype bfloat16 or --kv-cache-dtype auto."
+            )
 
     def _aiter_sparse_mla_unsupported_reason(
         self, vllm_config: VllmConfig
@@ -923,6 +938,7 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
                 num_decodes=attn_metadata.num_decodes,
                 num_decode_tokens=attn_metadata.num_decode_tokens,
                 max_query_len=attn_metadata.max_query_len,
+                dtype=q.dtype,
             )
         ):
             output = torch.empty(
