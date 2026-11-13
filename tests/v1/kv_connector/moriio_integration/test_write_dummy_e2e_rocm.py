@@ -358,6 +358,7 @@ READ_CASES = [
     Case("kimi_linear", "ROCM_AITER_MLA", _DEFAULT, _DEFAULT, read_mode=True),
     Case("qwen3_5_moe", "TRITON_ATTN", _DEFAULT, _DEFAULT, read_mode=True),
     Case("qwen3_dense", "TRITON_ATTN", _DEFAULT, _DEFAULT, read_mode=True),
+    Case("qwen3_dense", "ROCM_AITER_FA", _DEFAULT, _DEFAULT, read_mode=True),
     Case("qwen3_dense", "TRITON_ATTN", _DEFAULT, _DEFAULT, True, read_mode=True),
     Case("deepseek_v3", "ROCM_AITER_MLA", _DEFAULT, _DEFAULT, True, read_mode=True),
     Case("gemma3", "TRITON_ATTN", _DEFAULT, _DEFAULT, True, read_mode=True),
