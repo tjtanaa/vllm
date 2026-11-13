@@ -320,6 +320,8 @@ CASES = [
     # Attention-only: prefill transfers the whole prompt.
     Case("qwen3_dense", "TRITON_ATTN", _DEFAULT, _DEFAULT),
     Case("qwen3_dense", "ROCM_AITER_UNIFIED_ATTN", _DEFAULT, _DEFAULT),
+    # 32-token kernel blocks under the spec block: the KV view splits blocks.
+    Case("qwen3_dense", "ROCM_AITER_FA", _DEFAULT, _DEFAULT),
     # Without the hybrid KV cache manager: one cache group per model.
     Case("qwen3_dense", "TRITON_ATTN", _DEFAULT, _DEFAULT, hma_off=True),
     Case("deepseek_v3", "ROCM_AITER_MLA", _DEFAULT, _DEFAULT, hma_off=True),
