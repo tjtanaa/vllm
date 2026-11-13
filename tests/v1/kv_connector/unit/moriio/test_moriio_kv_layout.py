@@ -1167,3 +1167,41 @@ def test_remote_mamba_slots_must_be_non_negative():
 
     with pytest.raises(ValueError, match="must be non-negative"):
         moriio_layout.apply_mamba_offset_template(template, [1], [-1])
+
+
+@pytest.mark.parametrize(
+    "local_layout, remote_layout, remote_backend, raises",
+    [
+        pytest.param(None, [1], "TRITON_ATTN", True, id="local-split-other-backend"),
+        pytest.param([1], None, "TRITON_ATTN", True, id="peer-split-other-backend"),
+        pytest.param(None, [1], "FLASH_ATTN", False, id="same-backend"),
+        pytest.param(None, None, "TRITON_ATTN", False, id="no-layouts"),
+    ],
+)
+def test_raw_block_copy_requires_same_backend_when_one_side_has_no_head_layout(
+    local_layout, remote_layout, remote_backend, raises
+):
+    # A kernel-block split cache (e.g. 32-token kernel blocks under a 64-token
+    # spec block) has no head layout, so it is copied as raw blocks; another
+    # backend orders the tokens of the same block differently.
+    worker_cls = importlib.import_module(
+        "vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector"
+    ).MoRIIOConnectorWorker
+    worker = SimpleNamespace(
+        backend_name="FLASH_ATTN",
+        kv_head_layouts={} if local_layout is None else {"layer": local_layout},
+    )
+    remote = moriio_common.MoRIIOAgentMetadata(
+        engine_id="p",
+        agent_metadata=b"",
+        kv_caches_base_addr=[0],
+        num_blocks=8,
+        block_len=96,
+        attn_backend_name=remote_backend,
+        kv_head_layouts={} if remote_layout is None else {"layer": remote_layout},
+    )
+    if raises:
+        with pytest.raises(MoRIIOError, match="same --attention-backend"):
+            worker_cls._check_peer_backend(worker, "layer", remote)
+    else:
+        worker_cls._check_peer_backend(worker, "layer", remote)

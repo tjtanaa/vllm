@@ -3757,6 +3757,7 @@ class MoRIIOConnectorWorker:
         self, layer_name: str, remote_moriio_meta: MoRIIOAgentMetadata
     ) -> None:
         """Blocks are copied as units, so both sides must hold as many tokens."""
+        self._check_peer_backend(layer_name, remote_moriio_meta)
         remote = remote_moriio_meta.attention_block_sizes.get(layer_name)
         local = self.attention_block_sizes.get(layer_name)
         if remote is not None and local is not None and remote != local:
@@ -3780,9 +3781,29 @@ class MoRIIOConnectorWorker:
         local = self.kv_head_layouts.get(layer_name)
         remote_wire = remote_moriio_meta.kv_head_layouts.get(layer_name)
         if local is None or remote_wire is None:
-            # MLA latents, or a peer that does not advertise layouts.
+            # MLA latents, a kernel-block split cache, or a peer that does not
+            # advertise layouts: a raw copy is only safe with the same backend.
+            self._check_peer_backend(layer_name, remote_moriio_meta)
             return True
         return local.is_dense and HeadLayout.from_wire(remote_wire) == local
+
+    def _check_peer_backend(
+        self, layer_name: str, remote_moriio_meta: MoRIIOAgentMetadata
+    ) -> None:
+        """A layer without a head layout on one side is copied as raw blocks,
+        which only keeps K/V in place when both sides run the same backend."""
+        local = self.kv_head_layouts.get(layer_name)
+        remote = remote_moriio_meta.kv_head_layouts.get(layer_name)
+        if (local is None) != (remote is None) and (
+            remote_moriio_meta.attn_backend_name != self.backend_name
+        ):
+            raise MoRIIOError(
+                f"Layer {layer_name} cannot be described by a KV head layout on "
+                f"one side, so it is copied as raw blocks, but this side runs "
+                f"{self.backend_name} and the peer runs "
+                f"{remote_moriio_meta.attn_backend_name}; use the same "
+                "--attention-backend on prefill and decode"
+            )
 
     def _compute_read_attention_offsets(
         self,
