@@ -241,6 +241,22 @@ def _write_task(layer_name: str, transfer_id: str = "xfer") -> Any:
             id="interleaved-kernel-axis-from-spec",
         ),
         pytest.param(
+            (16, 2, 2, 6),
+            _full_spec(),
+            16,
+            {
+                "num_blocks": 8,
+                "block_size": 4,
+                "block_len": 96,
+                "block_stride": 48,
+                "local_kv_stride": None,
+                "remote_kv_stride": None,
+                "transfers_per_block": 1,
+            },
+            ([96, 288], [384, 480], [96, 96]),
+            id="standard-view-kernel-blocks",
+        ),
+        pytest.param(
             (8, 1, 4, 3),
             _mla_spec(),
             16,

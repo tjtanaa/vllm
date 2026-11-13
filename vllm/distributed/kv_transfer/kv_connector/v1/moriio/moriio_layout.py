@@ -273,20 +273,35 @@ def get_layer_transfer_geometry(
         isinstance(spec, AttentionSpec)
         and len(shape) == 4
         and shape[1] == spec.num_heads
-        and shape[2] == spec.num_states
+        and shape[2] > 0
+        and spec.num_states % shape[2] == 0
         and shape[3] * element_size == spec.state_content_size_bytes
     ):
-        # Standardized per-layer [B, H, N, C] view (MLA is just H == 1).
-        num_blocks, num_heads, num_states, content_dim = shape
+        # Standardized per-layer [B, H, N, C] view (MLA is just H == 1). A
+        # backend whose kernel block is smaller than the spec block (e.g.
+        # ROCM_AITER_FA: 32 vs 64) sees each block as back-to-back kernel blocks.
+        kernel_num_blocks, num_heads, num_states, content_dim = shape
+        kernel_blocks_per_block = spec.num_states // num_states
+        if kernel_num_blocks % kernel_blocks_per_block != 0:
+            raise ValueError(
+                f"Unsupported MoRIIO K/V cache shape for layer {layer_name}: "
+                f"{tuple(shape)} has {kernel_num_blocks} kernel blocks, "
+                f"not divisible by {kernel_blocks_per_block}"
+            )
+        num_blocks = kernel_num_blocks // kernel_blocks_per_block
         slot_size_bytes = num_heads * content_dim * element_size
-        block_len = 1 + sum((s - 1) * st for s, st in zip(shape[1:], stride[1:]))
-        block_len *= element_size
+        kernel_block_len = 1 + sum(
+            (s - 1) * st for s, st in zip(shape[1:], stride[1:])
+        )
+        block_len = (
+            (kernel_blocks_per_block - 1) * stride[0] + kernel_block_len
+        ) * element_size
         return LayerTransferGeometry(
             num_blocks=num_blocks,
             block_size=spec.block_size,
             block_len=block_len,
             slot_size_bytes=slot_size_bytes,
-            block_stride=stride[0],
+            block_stride=stride[0] * kernel_blocks_per_block,
             local_kv_stride=None,
             remote_kv_stride=None,
             transfers_per_block=1,
