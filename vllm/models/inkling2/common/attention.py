@@ -26,6 +26,12 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.inkling.nvidia.ops.fa4_rel_attention import bucket_max_seqlen_q
 from vllm.models.inkling.nvidia.sconv_swa_attn import InklingConvState
+from vllm.models.inkling2.nvidia.lora import add_linear_lora
+from vllm.models.inkling2.nvidia.ops.attention import (
+    _INKLING2_FA4_REL_ATTENTION_KERNEL,
+    plan_attention,
+)
+from vllm.models.inkling2.nvidia.ops.ll_gemm_sm120 import qkv_bmm, use_qkv_bmm
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
     canonicalize_singleton_dim_strides,
@@ -49,18 +55,14 @@ from vllm.v1.core.single_type_kv_cache_manager import (
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayerConfig
 
 from ..configs import Inkling2ModelConfig
-from .lora import add_linear_lora
-from .ops import use_sm100_kernels
 from .ops.attention import (
-    _INKLING2_FA4_REL_ATTENTION_KERNEL,
     gate_sink,
-    plan_attention,
     plan_decode_attention,
     rel_decode_attention,
 )
 from .ops.attention_sm90 import MODE_OUT_LSE, rel_attention
 from .ops.linear import linear
-from .ops.ll_gemm_sm120 import qkv_bmm, use_qkv_bmm
+from .ops.platform import use_sm100_kernels
 from .ops.sconv import attention_prologue, shift_rel_proj
 from .sconv import K_STREAM, V_STREAM, Inkling2ShortConv, conv_metadata
 
@@ -162,6 +164,15 @@ class Inkling2AttentionPassCache(nn.Module, AttentionLayerBase):
         return _kv_cache_layer_config(
             vllm_config, self.num_kv_heads, self.head_dim, self.sliding_window
         )
+
+
+def supported_kv_cache_dtypes() -> tuple[str, ...]:
+    """The KV cache dtypes the Inkling2 attention layers accept on this
+    device: FP8 and FP16 on SM12x only."""
+    supported: tuple[str, ...] = ("auto", "bfloat16")
+    if current_platform.is_device_capability_family(120):
+        supported += ("float16", "fp8", "fp8_e4m3")
+    return supported
 
 
 class Inkling2Attention(nn.Module, AttentionLayerBase):
@@ -291,9 +302,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         vllm_config = get_current_vllm_config()
         self.max_decode_query_len = max_decode_query_len(vllm_config)
         cache_dtype = vllm_config.cache_config.cache_dtype
-        supported: tuple[str, ...] = ("auto", "bfloat16")
-        if current_platform.is_device_capability_family(120):
-            supported += ("float16", "fp8", "fp8_e4m3")
+        supported = supported_kv_cache_dtypes()
         if cache_dtype not in supported:
             raise ValueError(f"Inkling2 KV cache dtype must be one of {supported}")
         self.fp8_kv = cache_dtype in ("fp8", "fp8_e4m3")

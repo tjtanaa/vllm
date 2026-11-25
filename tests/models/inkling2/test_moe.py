@@ -13,45 +13,36 @@ if not (
     current_platform.is_device_capability_family(100)
     or current_platform.is_device_capability(90)
     or current_platform.is_device_capability_family(120)
+    or current_platform.is_device_capability_family(80)
 ):
-    pytest.skip("Inkling2 MoE requires Hopper or Blackwell", allow_module_level=True)
+    pytest.skip("Inkling2 MoE requires Ampere or newer", allow_module_level=True)
 
-import vllm.models.inkling2.nvidia.moe as moe_module  # noqa: E402
+import vllm.models.inkling2.common.moe as moe_module  # noqa: E402
 import vllm.models.inkling2.nvidia.ops.moe_sm120 as moe_sm120  # noqa: E402
 import vllm.models.inkling2.nvidia.ops.trtllm_bmm as trtllm_bmm  # noqa: E402
-from vllm.models.inkling2.nvidia.moe import Inkling2MoE  # noqa: E402
-from vllm.models.inkling2.nvidia.ops import use_sm100_kernels  # noqa: E402
-from vllm.models.inkling2.nvidia.ops.activation import (  # noqa: E402
+from tests.models.inkling2.utils import (  # noqa: E402
+    E2M1,
+    dequant_mxfp8,
+    dequant_nvfp4,
+)
+from vllm.models.inkling2.common.moe import Inkling2MoE  # noqa: E402
+from vllm.models.inkling2.common.ops.activation import (  # noqa: E402
     _div_rn,
     _sigmoid_approx,
-    swiglu_quantize,
 )
+from vllm.models.inkling2.common.ops.linear import linear_k_groups  # noqa: E402
+from vllm.models.inkling2.common.ops.moe import select_experts  # noqa: E402
+from vllm.models.inkling2.nvidia.ops import use_sm100_kernels  # noqa: E402
+from vllm.models.inkling2.nvidia.ops.activation import swiglu_quantize  # noqa: E402
 from vllm.models.inkling2.nvidia.ops.block_scales import (  # noqa: E402
     shuffle_rows,
     swizzle_block_scales,
 )
-from vllm.models.inkling2.nvidia.ops.linear import linear_k_groups  # noqa: E402
-from vllm.models.inkling2.nvidia.ops.moe_sm90 import (  # noqa: E402
-    HummingExperts,
-    select_experts,
-)
+from vllm.models.inkling2.nvidia.ops.moe_sm90 import HummingExperts  # noqa: E402
 from vllm.models.inkling2.nvidia.ops.mxfp8 import mxfp8_quantize  # noqa: E402
 from vllm.models.inkling2.nvidia.ops.nvfp4 import nvfp4_quantize  # noqa: E402
 from vllm.models.inkling2.nvidia.ops.trtllm_bmm import ExpertPlan  # noqa: E402
 from vllm.triton_utils import tl, triton  # noqa: E402
-
-E2M1 = [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6]
-
-
-def dequant_nvfp4(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
-    lut = torch.tensor(E2M1, device=values.device)
-    v = torch.stack([lut[(values & 0xF).long()], lut[(values >> 4).long()]], -1)
-    return v.flatten(-2) * scales.float().repeat_interleave(16, -1)
-
-
-def dequant_mxfp8(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
-    exp2 = torch.exp2(scales.float() - 127).repeat_interleave(32, -1)
-    return values.float() * exp2
 
 
 def unshuffle_rows(x: torch.Tensor) -> torch.Tensor:
@@ -303,7 +294,11 @@ def test_bmm_matches_dequantized_matmul(fmt: str, tile: int, n: int, k: int):
 
 
 @pytest.mark.skipif(
-    not current_platform.is_device_capability(90), reason="Humming experts (Hopper)"
+    not (
+        current_platform.is_device_capability(90)
+        or current_platform.is_device_capability_family(80)
+    ),
+    reason="Humming experts (Hopper, Ampere and Ada)",
 )
 @pytest.mark.parametrize("fmt", ["nvfp4", "mxfp8"])
 @pytest.mark.parametrize("tokens", [1, 32])
@@ -325,6 +320,8 @@ def test_humming_experts_are_deterministic(fmt: str, tokens: int):
         nvfp4,
     )
     ids = torch.randint(0, num_global, (tokens, 8), device="cuda", dtype=torch.int32)
+    # Slot 0 is local: the random draw depends on the GPU's SM count.
+    ids[:, 0] %= num_experts
     ids = torch.where(ids < num_experts, ids, -1)
     rows = torch.arange(tokens * 8, device="cuda", dtype=torch.int32)
     src2dst = torch.where(ids.flatten() >= 0, rows, -1)
@@ -754,13 +751,34 @@ def test_padding_tokens_route_to_no_expert(
 
     out = moe(x)
     assert (out[tokens:] == 0).all()
-    torch.testing.assert_close(out[:tokens], expected, atol=0, rtol=0)
+    # Humming picks its kernels by row count: the rows match bitwise where
+    # both batches get the same kernels (on SM8x, 200 and 256 tokens do not).
+    # The SM12x Humming NVFP4 experts, or the flat-row backend (Humming
+    # everywhere else on CUDA).
+    humming = moe.experts.humming or moe.experts.flat_experts
+    if humming is None or all(
+        _humming_kernel(humming, name, tokens * 8)
+        == _humming_kernel(humming, name, padded * 8)
+        for name in ("w13", "w2")
+    ):
+        torch.testing.assert_close(out[:tokens], expected, atol=0, rtol=0)
+    else:
+        scale = expected.abs().max().item()
+        torch.testing.assert_close(out[:tokens], expected, atol=1e-2 * scale, rtol=2e-2)
+
+
+def _humming_kernel(humming: HummingExperts, name: str, rows: int):
+    """The Humming kernel config for `rows` local rows of projection `name`."""
+    for lower, upper, config in humming.tunings[name]:
+        if lower < rows <= upper:
+            return config
+    return None
 
 
 @pytest.mark.parametrize("hidden", [512, 2304, 4608])
 def test_combine_supports_mini_hidden_width(hidden):
     """Sum routed rows in slot order, including absent experts and a 256 tail."""
-    from vllm.models.inkling2.nvidia.ops.moe import combine
+    from vllm.models.inkling2.common.ops.moe import combine
 
     torch.manual_seed(42)
     down = torch.randn(16, hidden, device="cuda").bfloat16()

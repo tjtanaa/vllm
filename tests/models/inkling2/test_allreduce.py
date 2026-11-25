@@ -12,6 +12,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from vllm.models.inkling2.nvidia.ops import use_native_conv_mix
+
 BLOCK, HEADS, OFFSET = 16, 2, 256
 
 
@@ -22,13 +24,13 @@ def _gather(x, world):
 
 
 def _worker(rank: int, world: int, dim: int, port: int, queue) -> None:
+    from vllm.models.inkling2.common.ops.attn_res import attn_res
+    from vllm.models.inkling2.common.ops.moe import combine as moe_combine
+    from vllm.models.inkling2.common.ops.sconv import short_conv
     from vllm.models.inkling2.nvidia.ops.allreduce import (
         Inkling2AllReduceWorkspace,
         all_reduce_conv_mix,
     )
-    from vllm.models.inkling2.nvidia.ops.attn_res import attn_res
-    from vllm.models.inkling2.nvidia.ops.moe import combine as moe_combine
-    from vllm.models.inkling2.nvidia.ops.sconv import short_conv
 
     os.environ.update(MASTER_ADDR="localhost", MASTER_PORT=str(port))
     torch.accelerator.set_device_index(rank)
@@ -153,6 +155,8 @@ def _worker(rank: int, world: int, dim: int, port: int, queue) -> None:
 def test_fused_all_reduce_matches_unfused(world, dim):
     if torch.accelerator.device_count() < world:
         pytest.skip(f"needs {world} GPUs")
+    if not use_native_conv_mix():
+        pytest.skip("the fused kernels are built for Hopper and SM10x only")
     queue = mp.get_context("spawn").Queue()
     port = 29600 + world + dim // 256
     mp.spawn(_worker, args=(world, dim, port, queue), nprocs=world)
@@ -163,8 +167,8 @@ def test_fused_all_reduce_matches_unfused(world, dim):
 def _seq_parallel_worker(rank: int, world: int, dim: int, port: int, queue) -> None:
     import vllm._C_stable_libtorch  # noqa: F401
 
-    from vllm.models.inkling2.nvidia.ops.conv_mix import conv_mix
-    from vllm.models.inkling2.nvidia.ops.moe import combine as moe_combine
+    from vllm.models.inkling2.common.ops.conv_mix import conv_mix
+    from vllm.models.inkling2.common.ops.moe import combine as moe_combine
     from vllm.models.inkling2.nvidia.ops.moe import combine_push
     from vllm.models.inkling2.nvidia.ops.seq_parallel import SeqParallel
 
@@ -315,6 +319,8 @@ def test_seq_parallel_matches_unsharded(world, dim):
     later steps read."""
     if torch.accelerator.device_count() < world:
         pytest.skip(f"needs {world} GPUs")
+    if not use_native_conv_mix():
+        pytest.skip("the fused kernels are built for Hopper and SM10x only")
     queue = mp.get_context("spawn").Queue()
     port = 29640 + world + dim // 256
     mp.spawn(_seq_parallel_worker, args=(world, dim, port, queue), nprocs=world)

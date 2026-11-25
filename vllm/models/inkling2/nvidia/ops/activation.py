@@ -5,78 +5,20 @@ input quantization."""
 
 import torch
 
+from vllm.models.inkling2.common.ops.activation import FP32_MAX, _situ
+from vllm.models.inkling2.common.ops.e4m3 import e4m3_arg
+from vllm.models.inkling2.common.ops.pdl import gdc_launch_dependents, gdc_wait
 from vllm.triton_utils import tl, tldevice, triton
 
+from . import use_pdl
 from .mxfp8 import _mxfp8_block, _store_mxfp8_block
-from .nvfp4 import FP32_MAX, _quantize_block, _store_block
+from .nvfp4 import _quantize_block, _store_block
 from .trtllm_bmm import operand
 
 # Up to this many rows, the kernel lets the next one launch (and wait) as soon
 # as it starts, which hides its launch; with more, the waiting programs would
 # hold back the kernel's own.
 LAUNCH_DEPENDENTS_MAX_ROWS = 2048
-
-
-@triton.jit
-def _sigmoid_approx(x):
-    return tl.inline_asm_elementwise(
-        "{ .reg .f32 t; mul.rn.f32 t, $1, 0fBFB8AA3B; "
-        "ex2.approx.ftz.f32 t, t; add.rn.f32 t, t, 0f3F800000; "
-        "rcp.approx.ftz.f32 $0, t; }",
-        "=f,f",
-        [x],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@triton.jit
-def _div_rn(x, DIVISOR: tl.constexpr):
-    """Bitwise `tl.div_rn(x, DIVISOR)` without the division routine: the
-    product with the rounded reciprocal and one FMA correction step (whose
-    residual is clamped for infinite `x`) are exact for these divisors on
-    every float32 input."""
-    tl.static_assert(DIVISOR == 4.0 or DIVISOR == 25.0)
-    q = x * (1.0 / DIVISOR)
-    if DIVISOR != 4.0:
-        residual = tl.maximum(tl.fma(q, DIVISOR, -x), -FP32_MAX)
-        q = tl.fma(-residual, 1.0 / DIVISOR, q)
-    return q
-
-
-@triton.jit
-def _softcap(x, CAP: tl.constexpr):
-    if CAP > 0:
-        x = CAP * tl.inline_asm_elementwise(
-            "tanh.approx.f32 $0, $1;",
-            "=f,f",
-            [_div_rn(x, CAP)],
-            dtype=tl.float32,
-            is_pure=True,
-            pack=1,
-        )
-    return x
-
-
-@triton.jit
-def _situ(X, row, start, gamma, N: tl.constexpr, BLOCK: tl.constexpr, GATE_CAP, UP_CAP):
-    """fp32 values of the bf16 SiTU of columns `[start, start + BLOCK)`."""
-    # Interleaved (gate, up) bf16 pairs as one word each, loaded so that each
-    # thread holds whole 16-column blocks: column 16 * b + 4 * i + j at
-    # [i, b, j].
-    i = tl.arange(0, 4)[:, None, None]
-    b = tl.arange(0, BLOCK // 16)[None, :, None]
-    j = tl.arange(0, 4)[None, None, :]
-    cols = start + 16 * b + 4 * i + j
-    pairs = tl.load(X.to(tl.pointer_type(tl.uint32)) + row * N + cols)
-    pairs = tl.reshape(tl.permute(pairs, (1, 0, 2)), (BLOCK,))
-    gate = (pairs << 16).to(tl.float32, bitcast=True)
-    up = (pairs & 0xFFFF0000).to(tl.float32, bitcast=True)
-    sigmoid = _sigmoid_approx(gate)
-    gate = _softcap(gate, GATE_CAP)
-    up = _softcap(up, UP_CAP)
-    return (((gate * sigmoid) * up) * gamma).to(tl.bfloat16).to(tl.float32)
 
 
 @triton.jit
@@ -145,7 +87,7 @@ def _situ_quantize_kernel(
     # scales are read before waiting for the gate/up GEMM, which launches this
     # kernel only after its own wait for the routing kernel.
     if LAUNCH_DEPENDENTS:
-        tl.extra.cuda.gdc_launch_dependents()
+        gdc_launch_dependents()
     num_rows = tl.load(NumRows)
     r = tl.program_id(0)
     row, gamma, w_amax = _row_inputs(
@@ -154,7 +96,7 @@ def _situ_quantize_kernel(
     denominator = 0.0
     if NVFP4:
         denominator = 1536.0 * tl.load(WDenominator)
-    tl.extra.cuda.gdc_wait()
+    gdc_wait()
     start = tl.program_id(1) * (HEAD + TAIL)
     while r < num_rows:
         head = _situ(X, row, start, gamma, N, HEAD, GATE_CAP, UP_CAP)
@@ -254,8 +196,8 @@ def swiglu_quantize(
     _situ_quantize_kernel[(min(max_rows, 16384), n // (head + tail))](
         x,
         gammas,
-        values,
-        scales,
+        e4m3_arg(values),
+        e4m3_arg(scales),
         row_scales,
         routed,
         num_routed,
@@ -273,6 +215,17 @@ def swiglu_quantize(
         num_warps=num_warps,
         maxnreg=maxnreg,
         enable_fp_fusion=False,
-        launch_pdl=True,
+        launch_pdl=use_pdl(),
     )
     return values, scales, row_scales
+
+
+def __getattr__(name: str):
+    """Names that moved to `common/ops/` stay importable from this module."""
+    from importlib import import_module
+
+    for module in ("activation",):
+        moved = import_module(f"vllm.models.inkling2.common.ops.{module}")
+        if hasattr(moved, name):
+            return getattr(moved, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
