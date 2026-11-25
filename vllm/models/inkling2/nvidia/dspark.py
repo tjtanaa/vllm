@@ -33,6 +33,7 @@ from vllm.models.inkling2.common.ops.attention import (
     plan_decode_attention,
 )
 from vllm.models.inkling2.common.ops.linear import linear
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionBackend,
@@ -62,12 +63,31 @@ class _RMSNorm(nn.Module):
     def forward(
         self, x: torch.Tensor, residual: torch.Tensor | None = None
     ) -> torch.Tensor:
+        if not current_platform.is_cuda():
+            return self._forward_native(x, residual)
         from flashinfer.norm import fused_add_rmsnorm, rmsnorm
 
         if residual is None:
             return rmsnorm(x, self.weight, self.eps)
         # In place: residual += x; x = norm(residual), from the unrounded sum.
         fused_add_rmsnorm(x, residual, self.weight, self.eps)
+        return x
+
+    def _forward_native(
+        self, x: torch.Tensor, residual: torch.Tensor | None
+    ) -> torch.Tensor:
+        """flashinfer's RMSNorms in torch (fp32 statistics): in place
+        `residual += x; x = norm(residual)` with a residual."""
+        h = x.float()
+        if residual is not None:
+            # Normalized from the unrounded sum, as flashinfer.
+            h = h + residual.float()
+            residual.copy_(h)
+        h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + self.eps)
+        out = (h * self.weight.float()).to(x.dtype)
+        if residual is None:
+            return out
+        x.copy_(out)
         return x
 
 

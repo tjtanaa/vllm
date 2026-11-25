@@ -12,6 +12,7 @@ import functools
 
 import torch
 
+from vllm.models.inkling2.common.ops.intrinsics import IS_CUDA
 from vllm.triton_utils import tl, tldevice, triton
 
 
@@ -24,16 +25,23 @@ def _rope_inv_freq(head_dim: int, device: torch.device) -> torch.Tensor:
 
 @triton.jit
 def _bf16(x):
-    # Round to bf16 and back; inline asm keeps Triton from folding the casts.
-    rounded = tl.inline_asm_elementwise(
-        "cvt.rn.bf16.f32 $0, $1;",
-        "=h,f",
-        [x],
-        dtype=tl.bfloat16,
-        is_pure=True,
-        pack=1,
-    )
-    return rounded.to(tl.float32)
+    # Round to bf16 and back; inline asm keeps Triton from folding the casts
+    # on CUDA. Other backends round to nearest even on the bits, as the
+    # DSpark draft's `_round_bf16`.
+    if IS_CUDA:
+        rounded = tl.inline_asm_elementwise(
+            "cvt.rn.bf16.f32 $0, $1;",
+            "=h,f",
+            [x],
+            dtype=tl.bfloat16,
+            is_pure=True,
+            pack=1,
+        ).to(tl.float32)
+    else:
+        bits = x.to(tl.uint32, bitcast=True)
+        bits = (bits + 0x7FFF + ((bits >> 16) & 1)) & 0xFFFF0000
+        rounded = bits.to(tl.float32, bitcast=True)
+    return rounded
 
 
 @triton.jit

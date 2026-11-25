@@ -52,6 +52,34 @@ def _linear(in_features: int, out_features: int, bias: bool = True) -> nn.Linear
     return cls(in_features, out_features, bias=bias, dtype=torch.bfloat16)
 
 
+_SDPA_QUERY_BLOCK = 1024
+
+
+def _sdpa_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """Non-causal attention of each `cu_seqlens` sequence of `q`, `k`, `v`
+    `[T, heads, head_dim]` with torch SDPA, where the vLLM flash-attention
+    kernels are not built (ROCm RDNA). Queries go in blocks of
+    `_SDPA_QUERY_BLOCK` rows, so that SDPA's math fallback keeps at most a
+    `[heads, block, len]` score matrix (a whole image's would take ~8 GiB)."""
+    out = torch.empty_like(q)
+    bounds = cu_seqlens.tolist()
+    for start, end in zip(bounds[:-1], bounds[1:]):
+        ks, vs = (t[start:end].transpose(0, 1) for t in (k, v))
+        for q_start in range(start, end, _SDPA_QUERY_BLOCK):
+            q_end = min(q_start + _SDPA_QUERY_BLOCK, end)
+            qs = q[q_start:q_end].transpose(0, 1)
+            out[q_start:q_end] = F.scaled_dot_product_attention(
+                qs, ks, vs, scale=scale
+            ).transpose(0, 1)
+    return out
+
+
 class VisionMetadata(NamedTuple):
     # int32 [T, 4] (y, x, height, width) in native patches; CLS: y = x = -1.
     meta: torch.Tensor
@@ -85,7 +113,9 @@ class Inkling2VisionAttention(nn.Module):
             softmax_scale=self.head_dim**-0.5,
             causal=False,
         )
-        if use_sm100_kernels():
+        if not current_platform.is_cuda():
+            out = _sdpa_varlen(q, k, v, metadata.cu_seqlens, self.head_dim**-0.5)
+        elif use_sm100_kernels():
             # Built only for SM100 CUDA targets, so imported where it runs.
             from vllm.third_party.tml_fa4 import flash_attn_varlen_func as fa4
 

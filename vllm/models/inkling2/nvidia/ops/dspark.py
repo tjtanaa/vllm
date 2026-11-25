@@ -231,7 +231,7 @@ def _markov_gate_kernel(RAW, STATE, OUT, LATENT, RANK: tl.constexpr):
     state = tl.load(STATE + row * RANK + c).to(tl.float32)
     # Each torch op of the reference rounds to bf16; its sigmoid is
     # 1 / (1 + expf(-x)) with IEEE division.
-    gate = _round_bf16(tldevice.div_rn(1.0, 1.0 + tldevice.exp(-gate)))
+    gate = _round_bf16(tl.div_rn(1.0, 1.0 + tldevice.exp(-gate)))
     cand = _round_bf16(tldevice.tanh(cand))
     keep = _round_bf16(gate * state)
     update = _round_bf16(_round_bf16(1.0 - gate) * cand)

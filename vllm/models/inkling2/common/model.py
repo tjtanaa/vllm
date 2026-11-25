@@ -533,19 +533,27 @@ def xpu_unsupported_features(vllm_config: VllmConfig, vision: bool) -> list[str]
     return unsupported
 
 
+def rocm_unsupported_features(vllm_config: VllmConfig) -> list[str]:
+    """The requested features of an Inkling2 model that ROCm rejects at
+    init: LoRA (its expert kernels are CUDA-only). The vision tower runs
+    torch SDPA there and the DSpark draft its portable Triton kernels."""
+    return ["LoRA"] if vllm_config.lora_config is not None else []
+
+
 def _check_platform_support(vllm_config: VllmConfig, vision: bool) -> None:
     """On XPU and ROCm, fail at model init, not mid-forward, on
-    `xpu_unsupported_features` (both run the portable text model only).
-    This is the only DSpark gate there: it runs in the engine core when the
+    `xpu_unsupported_features` / `rocm_unsupported_features`. This is the
+    only DSpark gate on XPU: it runs in the engine core when the
     target model is built, whether the speculative method is given or
     detected. CUDA is not checked here."""
     if current_platform.is_xpu():
         name = "XPU"
+        unsupported = xpu_unsupported_features(vllm_config, vision)
     elif current_platform.is_rocm():
         name = "ROCm"
+        unsupported = rocm_unsupported_features(vllm_config)
     else:
         return
-    unsupported = xpu_unsupported_features(vllm_config, vision)
     if unsupported:
         raise NotImplementedError(
             f"Inkling2 on {name} does not support " + "; ".join(unsupported)
