@@ -168,10 +168,13 @@ class Inkling2AttentionPassCache(nn.Module, AttentionLayerBase):
 
 def supported_kv_cache_dtypes() -> tuple[str, ...]:
     """The KV cache dtypes the Inkling2 attention layers accept on this
-    device: FP8 and FP16 on SM12x only."""
+    device: FP8 and FP16 on SM12x, FP8 on ROCm (the portable kernels convert
+    unit-scale E4M3 in software there, as below SM90)."""
     supported: tuple[str, ...] = ("auto", "bfloat16")
     if current_platform.is_device_capability_family(120):
         supported += ("float16", "fp8", "fp8_e4m3")
+    elif current_platform.is_rocm():
+        supported += ("fp8", "fp8_e4m3")
     return supported
 
 

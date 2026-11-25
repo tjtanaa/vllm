@@ -300,10 +300,11 @@ def rel_attention(
     num_stages = 2
     num_warps = 8 if block_m >= 128 else 4
     if max_shared_memory() < 96 * 1024:
-        # 64 KiB of LDS (RDNA): one stage. On gfx1151, 16-key tiles under 8
-        # warps run prefill fastest (13-16 TFLOPs at 2K-64K keys) and
-        # 32-key tiles under 4 warps decode and verify at 200+ GB/s.
-        num_stages = 1
+        # 64 KiB of LDS (RDNA). On gfx1151, two stages of 16-key tiles under
+        # 8 warps run prefill fastest (14-15 TFLOPs at 2K-64K keys) and one
+        # stage of 32-key tiles under 4 warps decodes and verifies at 200+
+        # GB/s.
+        num_stages = 2 if block_m >= 128 else 1
         block_n = 16 if block_m >= 128 else 32 if block_m <= 32 else block_n // 2
         if block_m <= 32:
             num_warps = 4

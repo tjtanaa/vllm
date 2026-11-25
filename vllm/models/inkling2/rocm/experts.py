@@ -44,11 +44,11 @@ from vllm.models.inkling2.xpu.experts import (
 from vllm.triton_utils import tl, triton
 
 MXFP8_BLOCK = 32
-# Batches of at most this many tokens take the matrix-vector kernel (1.5x
-# faster than the emulation kernel on gfx1151 for one token). It reads the
+# Batches of at most this many tokens take the matrix-vector kernel (1.4-1.5x
+# faster than the emulation kernel on gfx1151 for one or two tokens). It reads the
 # weights once per slot, so on DSpark verify batches, whose tokens share
 # most experts, the emulation kernel (once per expert) is faster.
-NVFP4_GEMV_MAX_TOKENS = 1
+NVFP4_GEMV_MAX_TOKENS = 2
 
 
 @triton.jit
