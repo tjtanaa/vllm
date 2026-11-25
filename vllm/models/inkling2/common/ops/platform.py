@@ -70,3 +70,14 @@ def use_native_e4m3() -> bool:
     from vllm.platforms import current_platform
 
     return current_platform.is_cuda() and current_platform.has_device_capability(90)
+
+
+@functools.cache
+def max_shared_memory() -> int:
+    """Shared memory (LDS on ROCm) per block in bytes on the current device:
+    64 KiB on RDNA (e.g. gfx1151), where the SM90 tile sizes do not fit."""
+    from vllm.triton_utils import triton
+
+    device = triton.runtime.driver.active.get_current_device()
+    props = triton.runtime.driver.active.utils.get_device_properties(device)
+    return props["max_shared_mem"]

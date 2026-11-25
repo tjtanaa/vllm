@@ -19,6 +19,7 @@ import torch
 from vllm.triton_utils import tl, triton
 
 from .e4m3 import _NATIVE_E4M3, _e4m3_f16, e4m3_arg
+from .platform import max_shared_memory
 
 # The query tile of tml_fa4 that shears the relative logits.
 _SHEAR_TILE = tl.constexpr(128)
@@ -295,6 +296,11 @@ def rel_attention(
         lse = out
     block_m = _block_m(max_query_len, group)
     tokens_per_tile = block_m // group
+    block_n = 64 if block_m >= 128 else 128 if block_m <= 32 else 64
+    num_stages = 2
+    if max_shared_memory() < 96 * 1024:
+        # 64 KiB of LDS (RDNA): one stage of halved key tiles fits.
+        block_n, num_stages = block_n // 2, 1
     num_reqs = cache_seqlens.shape[0]
     grid = (
         triton.cdiv(max_query_len, tokens_per_tile),
@@ -343,7 +349,7 @@ def rel_attention(
         DRAFT=draft,
         MODE=mode,
         BLOCK_M=block_m,
-        BLOCK_N=64 if block_m >= 128 else 128 if block_m <= 32 else 64,
+        BLOCK_N=block_n,
         num_warps=8 if block_m >= 128 else 4,
-        num_stages=2,
+        num_stages=num_stages,
     )
