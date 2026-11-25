@@ -19,7 +19,9 @@ def use_sm100_kernels() -> bool:
     SM12x uses Triton experts and does not support tcgen05."""
     from vllm.platforms import current_platform
 
-    return current_platform.is_device_capability_family(100)
+    return current_platform.is_cuda() and current_platform.is_device_capability_family(
+        100
+    )
 
 
 @functools.cache
@@ -28,12 +30,11 @@ def use_pdl() -> bool:
     (griddepcontrol) and TMA descriptors, both SM90+ (named and defined as in
     vllm-project/vllm#69165). XPU reports no device capability: there the
     kernels run stream ordered. ROCm reports its gfx capability (gfx942 is
-    9.4), so this is True there, as in #69165; ROCm does not reach these
-    kernels (it rejects the inkling2 quantization; vllm-project/vllm#67685
-    routes it to its own `amd/` package)."""
+    9.4, gfx1151 11.5), but griddepcontrol and the NVIDIA TMA descriptors
+    do not exist there, so it runs stream ordered too."""
     from vllm.platforms import current_platform
 
-    return current_platform.has_device_capability(90)
+    return current_platform.is_cuda() and current_platform.has_device_capability(90)
 
 
 @functools.cache
@@ -55,14 +56,17 @@ def use_native_conv_mix() -> bool:
     for Hopper and SM10x only."""
     from vllm.platforms import current_platform
 
-    return any(current_platform.is_device_capability_family(f) for f in (90, 100))
+    return current_platform.is_cuda() and any(
+        current_platform.is_device_capability_family(f) for f in (90, 100)
+    )
 
 
 @functools.cache
 def use_native_e4m3() -> bool:
     """Whether the kernels let Triton convert e4m3 (fp8e4nv), SM90+. Below,
     they take e4m3 tensors as uint8 and convert in software (`ops/e4m3.py`):
-    on SM89, Triton 3.8 converts fp32 through fp16, rounding twice."""
+    on SM89, Triton 3.8 converts fp32 through fp16, rounding twice. ROCm
+    and XPU convert in software."""
     from vllm.platforms import current_platform
 
-    return current_platform.has_device_capability(90)
+    return current_platform.is_cuda() and current_platform.has_device_capability(90)

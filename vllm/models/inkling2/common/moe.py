@@ -87,11 +87,15 @@ def flat_experts_class(
 ) -> Callable[..., FlatExperts]:
     """This platform's `FlatExperts` constructor for `quant_format` experts
     with `topk` slots per token and the SiTU softcaps of the layer: the XPU
-    backends on XPU, Humming elsewhere."""
+    backends on XPU, the ROCm ones on ROCm, Humming elsewhere."""
     if current_platform.is_xpu():
         from vllm.models.inkling2.xpu.experts import xpu_flat_experts
 
         return xpu_flat_experts(quant_format, topk, gate_cap, up_cap)
+    if current_platform.is_rocm():
+        from vllm.models.inkling2.rocm.experts import rocm_flat_experts
+
+        return rocm_flat_experts(quant_format, topk, gate_cap, up_cap)
     return HummingExperts
 
 

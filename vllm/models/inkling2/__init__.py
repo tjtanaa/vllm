@@ -33,17 +33,19 @@ _MODULES = {
 
 
 # The entry modules each platform package has; the others come from `nvidia`.
-_PLATFORM_MODULES = {"xpu": ("model", "loop")}
+_PLATFORM_MODULES = {"xpu": ("model", "loop"), "rocm": ("model", "loop")}
 
 
 def _platform_package(module: str) -> str:
-    """The package of this platform's entry `module`: `xpu` on XPU (the
-    text models; DSpark is rejected there at model init), else `nvidia` (a
-    ROCm `amd` package, vllm-project/vllm#67685, would be selected here)."""
+    """The package of this platform's entry `module`: `xpu` on XPU and
+    `rocm` on ROCm (the text models; DSpark is rejected there at model
+    init), else `nvidia`."""
     from vllm.platforms import current_platform
 
     if current_platform.is_xpu() and module in _PLATFORM_MODULES["xpu"]:
         return "xpu"
+    if current_platform.is_rocm() and module in _PLATFORM_MODULES["rocm"]:
+        return "rocm"
     return "nvidia"
 
 

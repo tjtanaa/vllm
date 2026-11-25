@@ -661,6 +661,7 @@ class RocmPlatform(Platform):
         "modelopt_mxfp8",
         "modelopt_mixed",
         "modelopt_int8",
+        "inkling2",
         "fp8_per_tensor",
         "fp8_per_block",
         "fp8_per_channel",

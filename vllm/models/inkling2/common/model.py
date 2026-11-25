@@ -534,17 +534,21 @@ def xpu_unsupported_features(vllm_config: VllmConfig, vision: bool) -> list[str]
 
 
 def _check_platform_support(vllm_config: VllmConfig, vision: bool) -> None:
-    """On XPU, fail at model init, not mid-forward, on
-    `xpu_unsupported_features`. This is the only DSpark gate on XPU: it
-    runs in the engine core when the target model is built, whether the
-    speculative method is given or detected. Other platforms are not
-    checked here."""
-    if not current_platform.is_xpu():
+    """On XPU and ROCm, fail at model init, not mid-forward, on
+    `xpu_unsupported_features` (both run the portable text model only).
+    This is the only DSpark gate there: it runs in the engine core when the
+    target model is built, whether the speculative method is given or
+    detected. CUDA is not checked here."""
+    if current_platform.is_xpu():
+        name = "XPU"
+    elif current_platform.is_rocm():
+        name = "ROCm"
+    else:
         return
     unsupported = xpu_unsupported_features(vllm_config, vision)
     if unsupported:
         raise NotImplementedError(
-            "Inkling2 on XPU does not support " + "; ".join(unsupported)
+            f"Inkling2 on {name} does not support " + "; ".join(unsupported)
         )
 
 
