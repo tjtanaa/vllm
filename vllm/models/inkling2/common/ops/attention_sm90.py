@@ -298,9 +298,15 @@ def rel_attention(
     tokens_per_tile = block_m // group
     block_n = 64 if block_m >= 128 else 128 if block_m <= 32 else 64
     num_stages = 2
+    num_warps = 8 if block_m >= 128 else 4
     if max_shared_memory() < 96 * 1024:
-        # 64 KiB of LDS (RDNA): one stage of halved key tiles fits.
-        block_n, num_stages = block_n // 2, 1
+        # 64 KiB of LDS (RDNA): one stage. On gfx1151, 16-key tiles under 8
+        # warps run prefill fastest (13-16 TFLOPs at 2K-64K keys) and
+        # 32-key tiles under 4 warps decode and verify at 200+ GB/s.
+        num_stages = 1
+        block_n = 16 if block_m >= 128 else 32 if block_m <= 32 else block_n // 2
+        if block_m <= 32:
+            num_warps = 4
     num_reqs = cache_seqlens.shape[0]
     grid = (
         triton.cdiv(max_query_len, tokens_per_tile),
@@ -350,6 +356,6 @@ def rel_attention(
         MODE=mode,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
-        num_warps=8 if block_m >= 128 else 4,
+        num_warps=num_warps,
         num_stages=num_stages,
     )

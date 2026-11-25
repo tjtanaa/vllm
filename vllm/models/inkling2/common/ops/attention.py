@@ -13,7 +13,7 @@ from vllm.utils.platform_utils import num_compute_units
 from .attention_sm90 import MODE_GATED, MODE_PARTIAL, rel_attention
 from .intrinsics import ex2, lg2, sigmoid
 from .pdl import gdc_wait
-from .platform import pdl_launch_kwargs, use_sm100_kernels
+from .platform import max_shared_memory, pdl_launch_kwargs, use_sm100_kernels
 
 
 @triton.jit
@@ -146,7 +146,12 @@ def plan_decode_attention(
         if work <= (16 if max_query_len <= 2 else 8):
             return triton.cdiv(rel_extent - 1, _FA4_BLOCK_N) + 1
         return 5 if work <= 16 else 3 if work <= 32 else 2 if work <= 64 else 1
-    return max(num_sms // work, min(num_sms // 8, 6 * num_sms // work))
+    splits = max(num_sms // work, min(num_sms // 8, 6 * num_sms // work))
+    if max_shared_memory() < 96 * 1024:
+        # RDNA (gfx1151): twice the splits keep the 32-key tiles of
+        # `attention_sm90` streaming the KV cache at full bandwidth.
+        splits *= 2
+    return splits
 
 
 @triton.jit
