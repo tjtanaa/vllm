@@ -25,7 +25,7 @@ requires_sm90 = pytest.mark.skipif(
 FP8_KV_DTYPES = [torch.float8_e4m3fn] if _cuda_attention else []
 # The Triton attention kernels also run on XPU.
 requires_triton_attention = pytest.mark.skipif(
-    not (_cuda_attention or current_platform.is_xpu()),
+    not (_cuda_attention or current_platform.is_xpu() or current_platform.is_rocm()),
     reason="Inkling2 attention requires Ampere or newer, or XPU",
 )
 

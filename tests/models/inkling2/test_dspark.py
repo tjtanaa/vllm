@@ -16,6 +16,7 @@ if not (
     or current_platform.is_device_capability(90)
     or current_platform.is_device_capability_family(120)
     or current_platform.is_device_capability_family(80)
+    or current_platform.is_rocm()
 ):
     pytest.skip("Inkling2 requires Ampere or newer", allow_module_level=True)
 

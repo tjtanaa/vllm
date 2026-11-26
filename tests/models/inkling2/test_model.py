@@ -27,6 +27,7 @@ if not (
     or current_platform.is_device_capability_family(120)
     or current_platform.is_device_capability_family(80)
     or current_platform.is_xpu()
+    or current_platform.is_rocm()
 ):
     pytest.skip("Inkling2 requires Ampere or newer, or XPU", allow_module_level=True)
 
